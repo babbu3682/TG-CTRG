@@ -1,14 +1,14 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "CTRG-3D with GRPO post-training and label-vote ensemble"
+title: "TG-CTRG: Template-Guided CT Report Generation"
 abstract: "2nd-place solution of the VLM3D Challenge 2026 (MICCAI) CT report generation track."
 authors:
   - family-names: Kyung
     given-names: Sunggu
 version: "1.0.0"
-date-released: "2026-11-04"
-repository-code: "<GITHUB_REPO_URL>"
-license: "CC-BY-NC-SA-4.0"
+date-released: "2026-11-05"
+repository-code: "https://github.com/babbu3682/TG-CTRG"
+license: "MIT"
 keywords:
   - chest CT
   - radiology report generation

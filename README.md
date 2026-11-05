@@ -1,4 +1,4 @@
-# CTRG-3D with GRPO post-training and label-vote ensemble
+# TG-CTRG: Template-Guided CT Report Generation
 
 2nd place, VLM3D Challenge 2026 — CT Report Generation (MICCAI 2026).
 
@@ -30,11 +30,11 @@ Validation split (1,552 studies, official scorer):
 
 ## Pretrained weights
 
-All checkpoints are hosted on Hugging Face: **`<HF_REPO>`** (≈21 GB; Qwen3-8B is fetched separately).
+All checkpoints are hosted on Hugging Face: **`<HF_USER>/TG-CTRG`** (≈21 GB; Qwen3-8B is fetched separately).
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-bash scripts/hf_download_weights.sh <HF_REPO> docker/weights
+bash scripts/hf_download_weights.sh <HF_USER>/TG-CTRG docker/weights
 ```
 
 | file | component |
@@ -179,11 +179,11 @@ If you use this code or the released weights, please cite the repository (a pape
 linked here when available):
 
 ```bibtex
-@misc{kyung2026ctrg3d,
-  title        = {CTRG-3D with GRPO post-training and label-vote ensemble: 2nd place in the VLM3D 2026 CT report generation challenge},
+@misc{kyung2026tgctrg,
+  title        = {TG-CTRG: Template-Guided CT Report Generation with GRPO post-training and label-vote ensemble},
   author       = {Kyung, Sunggu},
   year         = {2026},
-  howpublished = {\url{<GITHUB_REPO_URL>}},
+  howpublished = {\url{https://github.com/babbu3682/TG-CTRG}},
   note         = {GitHub repository}
 }
 ```
@@ -199,4 +199,6 @@ This work builds on, and was inspired by, the following projects:
 
 We also thank the authors of [Qwen3](https://github.com/QwenLM/Qwen3) and [Qwen3-Embedding](https://github.com/QwenLM/Qwen3-Embedding), [TRL](https://github.com/huggingface/trl) (GRPO), [PEFT](https://github.com/huggingface/peft), and the VLM3D Challenge organisers for the CT-RATE dataset and the RadBERT-based evaluation kit.
 
-Fine-tuned weights are trained on CT-RATE (CC BY-NC-SA 4.0) and are released for non-commercial research use.
+## License
+
+Code in this repository is released under the MIT License (see `LICENSE`). The `pillar-pretrain/`, `pillar-finetune/` and `rad-vision-engine/` subtrees keep their upstream ECL-2.0 licenses and `CTRG-3D/` its upstream Apache-2.0 license. Fine-tuned weights are trained on CT-RATE (CC BY-NC-SA 4.0) and are released for non-commercial research use.
