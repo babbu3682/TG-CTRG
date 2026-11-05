@@ -1,0 +1,95 @@
+#!/bin/bash
+# ==============================================================================
+# newenc B (gtweight w=5, ckpt-7455) 의 오프라인 비전 캐시 -- GRPO 후학습의 전제.
+#
+#   sbatch run_sbatch_cache_newencB
+#
+# 왜 새로 만들어야 하나: 기존 캐시 data/vision_cache/checkpoint-16412 는 **옛 인코더**
+# (ctrate_pillar0_chest_opensource.yaml, vis_dim 1152, 65,536 encoder token) 의
+# post-fc 출력이다. B 는 lapa 인코더(vis_dim 384, single-scale 1,024 token)
+# 이므로 같은 볼륨에서 전혀 다른 feature 가 나온다. 옛 캐시로 B 를 RL 하면 B 가 본
+# 적 없는 시각 입력으로 학습하게 되고, 그건 loss 곡선에 아무 표시도 남기지 않는다.
+#
+# 캐시 shape 은 (N, 128, 4096) 으로 동일하다 -- fc 뒤에서 잘랐기 때문에 vis_dim 이
+# 384 든 1152 든 LLM hidden 4096 으로 투사된 뒤다. 그래서 GRPO/채점 코드는 그대로 쓰고
+# 경로만 바꾼다.
+#
+# CKPT 는 ryuj4 트리가 아니라 sunggu 트리의 보존 사본을 쓴다. ryuj4 의
+# 28194391/28194394 (30 epoch resume) 가 시작되면 save_total_limit 회전으로
+# checkpoint-7455 가 사라질 수 있기 때문이다. 보존 사본은 2026-08-26 에 복사했다.
+#
+# WALLTIME: 옛 인코더 실측이 train 23,869 볼륨에 45.7 min (0.115 s/volume). 새
+# 인코더는 stem 이 비싸고 perceiver 가 싸므로 어느 쪽으로 갈지 미리 알 수 없다.
+# 스크립트가 100 볼륨 뒤 s/volume 을 찍으므로 실측치는 로그에 남는다. 8 h 여유.
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --job-name ctrg-cache-newencB
+#SBATCH --time 8:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+set -euo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+CKPT="${CKPT:-${REPO}/scripts/outputs/preserved/newencB_ep15_ckpt7455}"
+YAML="${REPO}/src/Model/ctrate_pillar0_chest_lapa.yaml"
+GTCOV="${REPO}/data/sentence_labels"
+RVE=/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+OUT="${REPO}/data/vision_cache/$(basename "${CKPT}")"
+
+echo "=============================================================="
+echo " newenc B vision cache          $(date '+%F %T')"
+echo "   checkpoint : ${CKPT}"
+echo "   yaml       : $(basename "$YAML")   (vis_dim 384, single-scale)"
+echo "   out        : ${OUT}"
+echo "=============================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+for f in "${CKPT}/model.safetensors" "$YAML" \
+         "${GTCOV}/merged_train_gtcov.json" \
+         "/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json" \
+         "${RVE}/train/mapping_path.csv" "${RVE}/valid/mapping_path.csv"; do
+    [ -s "$f" ] || { echo "missing: $f" >&2; exit 1; }
+done
+for fl in --model_config_yaml --vis_dim --json_path --rve_manifest --limit; do
+    grep -q -- "add_argument(\"${fl}\"" "$REPO/scripts/build_vision_cache.py" \
+        || { echo "flag not in scripts/build_vision_cache.py: $fl" >&2; exit 1; }
+done
+
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+module load singularity
+run() {
+    singularity exec --nv -B /vf,/data,/spin1 \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
+        "$SIF" bash -lc "source ${REPO}/.venv/bin/activate && cd ${REPO} && \
+            python scripts/build_vision_cache.py --ckpt '${CKPT}' \
+                --model_config_yaml '${YAML}' --vis_dim 384 $*"
+}
+
+# 16 볼륨 smoke -- 인코더가 붙었는지, shape 이 (N,128,4096) 인지 3분 안에 확인한다.
+echo "=============== smoke: valid 16 volumes ==============="
+run --split valid --limit 16 --batch_size 2 --num_workers 8 \
+    --json_path '/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json' \
+    --rve_manifest "${RVE}/valid/mapping_path.csv"
+
+# 채점용. 표준 full valid 1,552 -- B 의 gtcov valid(1,551) 가 아니다. 채점은 다른
+# 모든 케이스와 같은 exam 집합에서 해야 비교가 성립한다.
+echo "=============== valid 1,552 ==============="
+run --split valid --batch_size 8 --num_workers 12 \
+    --json_path '/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json' \
+    --rve_manifest "${RVE}/valid/mapping_path.csv"
+
+# RL 프롬프트 풀. B 가 학습한 gtcov split(23,850) 을 쓴다.
+echo "=============== train 23,850 (gtcov) ==============="
+run --split train --batch_size 8 --num_workers 12 \
+    --json_path "${GTCOV}/merged_train_gtcov.json" \
+    --rve_manifest "${RVE}/train/mapping_path.csv"
+
+ls -la "${OUT}/"
+echo "=============== done  $(date '+%F %T') ==============="

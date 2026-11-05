@@ -1,0 +1,50 @@
+# lapa -- pillar0_ctrate_chest_ct_256_phrase_align.yaml 과 같은 데이터에, 아래쪽 두 줄
+# (random_phrase_ratio, return_phrase_ids) 추가 + 배치 확대.
+#
+# batch_size 2 -> 4, 즉 contrastive 윈도우가 32 -> 64 볼륨 (world_size 2 x 4 x accum_freq 8).
+# vision tower 가 3 scale 을 nearest 로 올려 concat 한 32768 토큰 대신 단일 scale 1024 토큰만
+# 반환하므로 activation 과 VL-CABS bmm 이 32배 줄었고, 그만큼을 negative 수로 바꾼 것.
+#
+# 4 가 상한이다 -- 추정이 아니라 실측. job 27526199 (A100 80GB x2) 에서 nvidia-smi 기준
+# GPU0 78.2/81.9 GiB (95%), GPU1 79.0/81.9 GiB (96%). 참조 stage-1 의 "batch 10 -> 62.8 GiB"
+# 로 외삽하면 4 는 25 GiB 여야 했는데 3배 빗나갔다. 참조는 loss 윈도우 = 배치(10 이미지,
+# ~120 phrase)였지만 여기 윈도우는 world_size x batch x accum = 64 이미지, ~490 phrase 이고
+# VL-CABS aggregate 는 [N_img, N_phrase, D] 로 배치가 아니라 윈도우에 대해 이차로 커진다.
+# 게다가 그 loss 가 optimizer step 당 accum_freq(8) 번 호출된다.
+# => 이 값을 올리려면 accum_freq 를 같이 줄여 윈도우를 유지하거나 grad checkpointing 이 필요.
+ctrate_chest_ct_phrase_align:
+  image_size: 256
+  modality: chest_ct
+  args:
+    train_data : /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_train_filtered_prob_half.json
+    val_data : /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    model: Qwen3-Embedding-8B-Atlas_ps16x16_d2d2d8_multiscale_multimodal_chest_ct_11ch
+    csv_img_key: nii_path
+    csv_caption_key: report_metadata
+    csv_separator: ","
+    medcsv_caption_transform: capitalize_title
+    image_mean: 0.289
+    image_std: 0.198
+    medcsv_target_d: 256
+    target_hw: 256
+    medcsv_pad_value: -1024
+    batch_size: 4
+    val_batch_size: 4
+    workers: 2
+    # RVE configuration (LZ4 lossless cache -- do NOT switch back to the HEVC cache)
+    use_rve: true
+    rve_dir: ./data/ctrate/ctrate_cache_1.25mm_lz4
+    rve_manifest: ./data/ctrate/ctrate_cache_1.25mm_lz4/mapping_path.csv
+    window_type: all
+    text_cache_dir: ./data/text_cache_qwen3_embedding_8b_phrase
+    use_cache: false
+    # No JEPA predictor in this variant -- it's the only consumer of `query`.
+    use_query: "False"
+
+    # ---- lapa only ----
+    # Keep a random 80% of each report's sentences per epoch (train only). Text-side
+    # augmentation, and it also thins the verbatim-duplicate collisions in a window.
+    random_phrase_ratio: 0.8
+    # Emit a per-sentence md5 fingerprint so the loss can identify verbatim-identical phrases
+    # across volumes. Required by --mask-duplicate-phrases; without it that flag is a no-op.
+    return_phrase_ids: "True"

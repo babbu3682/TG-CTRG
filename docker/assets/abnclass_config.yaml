@@ -1,0 +1,236 @@
+# NLST DETR Atlas Configuration
+# This config is for training on NLST dataset with DETR object detection
+# and Atlas backbone for lung cancer risk prediction
+
+experiment:
+  name: CTRATE_FT_Atlas_abn_bce_freeze_original_pillar
+  tags: ["ctrate", "atlas", "apply-pooling", "abn", "bce", "pillar0"]
+  notes: "Fine-tuning Atlas(pillar-0 pretrained) for abn classification task (BCE loss, grad clip, epoch-unified wandb logging)"
+
+main:
+  exp_name: CTRATE_FT_Atlas_abn_bce_freeze_original_pillar
+  seed: 42
+  log_dir: ./logs
+  checkpoints_dir: ./logs/CTRATE
+  timestamp_save_dir: False
+
+  disable_wandb: False
+  wandb_offline: False
+  wandb_project: null
+  wandb_entity: null
+
+  ckpt_freq: 1
+  monitor: val_loss
+
+  allow_overwriting_experiment_checkpoints: True
+  find_unused_parameters: False
+  force_loading_train_dataloader: False
+
+  phases:
+    train: True
+    dev: True
+    test: True
+
+  freeze_backbone: "True"
+
+engine:
+  type: Classifier
+  max_epochs: 50
+  kwargs:
+    resume: null
+    accumulate_grad_batches: 1
+    precision: bf16-mixed
+    binary_pred: True
+    log_loss_components: True
+    log_interval: 50
+    limit_num_batches: null
+    # backbone이 완전히 freeze된 linear-probe 세팅에서는 augmentation이 backbone을 전혀 적응시키지
+    # 못하면서, 매 스텝 같은 샘플에 다른 회전을 줘서 "고정된" feature에 노이즈만 추가한다.
+    # pillar-0 저자의 공식 linear-probing 코드(rate-evals)도 augmentation 없이 캐시된 임베딩을
+    # 그대로 학습에 쓴다 — 그와 맞춰서 끔.
+    use_gpu_augs: False
+    train_gpu_augs:
+      - type: RandomRotation3D
+        kwargs:
+          degrees: [0.0, 0.0, 20.0]
+    test_gpu_augs: []
+
+dataloader:
+  batch_size: 30
+  eval_batch_size: 30
+  num_workers: 4
+  class_bal: False
+  train_drop_last: True
+  val_drop_last: False
+  multi_gpu_eval: True
+  persistent_workers: True
+  prefetch_factor: 2
+  # abn head는 Linear(1152,18) 하나뿐(~2만 파라미터)이라 gradient explosion 위험이 낮은데,
+  # pos_weight(최대 12.82배)로 커진 gradient를 global norm 1.0으로 강하게 누르고 있었더니
+  # 11 epoch(~17000 step) 동안 train_loss가 1.1175->1.1133으로 사실상 안 움직이고
+  # val_macro_auroc도 0.51~0.55에 머무름 (실제 학습률이 사실상 훨씬 작게 동작한 것으로 추정).
+  # 일단 끄고 관찰.
+  clip_grad: null
+  no_shuffle_training_set: False
+  use_null_collate: False
+  frac_train_samples: 1.0
+  no_cache_misses_allowed: False
+
+dataset:
+  type: CTRATE_ABN_Dataset
+  modality: CT
+  num_classes: 18
+  mode: "abn"
+  shared_dataset_kwargs:
+    anatomy: "chest_ct"
+    windows: 'all'
+    target_d: 256
+    target_hw: 256
+    pad_value: -1024
+    rve_root: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/
+  
+
+  dataset_train_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_train_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/train/mapping_path.csv
+    is_train: True
+    label_csv: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/train_predicted_labels.csv
+  dataset_dev_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    label_csv: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/valid_predicted_labels.csv
+  dataset_test_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    label_csv: /data/drdcad/sunggu/0.Challenge/pillar-pretrain/valid_predicted_labels.csv
+    
+
+
+model:
+  type: MultiStage
+  kwargs:
+    # pool_name/pool_kwargs 제거: 아래 abn head가 use_pooled_features=True라 MultiAttentionPool을 안 씀
+    # (activ를 억지로 원해상도로 재구성한 뒤 attention pooling 하는 대신, backbone이 이미 스케일별로
+    #  maxpool+concat해 놓은 "pooled" 벡터(x, 3 scale * 384 = 1152dim, L2-normalized)를 바로 사용)
+    backbone_model_type: MultimodalAtlas
+    backbone_kwargs:
+      pretrained: True
+      model_repo_id: "/data/drdcad/sunggu/0.Challenge/pillar-pretrain/checkpoints/Pillar0-ChestCT"
+      model_revision: main
+
+    head_models:
+      abn:
+        type: MultiLabelClassificationHead
+        kwargs:
+          input_dim: 1152
+          num_classes: 18
+          dropout: 0.1
+        apply_pooling: False
+        use_pooled_features: True
+        enable_at_eval: True
+
+
+optimizer:
+  type: AdamW
+  kwargs:
+    lr: 3.0e-4
+    # pooled feature가 L2-normalize되어 있어 성분 크기가 작음(~1/sqrt(1152)≈0.03) — 의미 있는
+    # logit 차이를 내려면 head weight가 상대적으로 커야 하는데, wd가 매 스텝 이를 0으로 끌어당김.
+    # rate-evals 공식 linear-probe 레시피도 weight_decay=0. 맞춰서 끔.
+    weight_decay: 0.0
+
+  scheduler:
+    interval: epoch
+    frequency: 1
+    type: CosineAnnealingWarmup
+    kwargs:
+      min_lr: 1.0e-5
+      warmup_epochs: 4
+      max_epochs: 50
+
+  layer_decay: 0.9
+
+metrics:
+  epoch_metrics:
+    train: &base_metrics
+      - type: AbnMetric
+        kwargs:
+          logit_key: abn
+          target_key: label
+    val: *base_metrics
+    test: *base_metrics
+
+  losses:
+    - type: MultiLabelWeightedBCELoss
+      weight: 1.0
+      kwargs:
+        logit_key: abn
+        target_key: label
+        pos_weight: null
+        pos_weight_max: null
+
+
+
+
+report_templates:
+  default_positive_threshold: 0.51
+  default_negative_threshold: 0.49
+  labels:
+    - name: "Medical material"
+      # positive_threshold: 0.8
+      # negative_threshold: 0.2
+      positive: "Medical material is present."
+      negative: "No medical material is present."
+    - name: "Arterial wall calcification"      
+      positive: "Arterial wall calcification is present."
+      negative: "No arterial wall calcification is present."
+    - name: "Cardiomegaly"
+      positive: "Cardiomegaly is present."
+      negative: "No cardiomegaly is present."
+    - name: "Pericardial effusion"      
+      positive: "Pericardial effusion is present."
+      negative: "No pericardial effusion is present."
+    - name: "Coronary artery wall calcification"      
+      positive: "Coronary artery wall calcification is present."
+      negative: "No coronary artery wall calcification is present."
+    - name: "Hiatal hernia"      
+      positive: "Hiatal hernia is present."
+      negative: "No hiatal hernia is present."
+    - name: "Lymphadenopathy"      
+      positive: "Lymphadenopathy is present."
+      negative: "No lymphadenopathy is present."
+    - name: "Emphysema"      
+      positive: "Emphysema is present."
+      negative: "No emphysema is present."
+    - name: "Atelectasis"      
+      positive: "Atelectasis is present."
+      negative: "No atelectasis is present."
+    - name: "Lung nodule"      
+      positive: "Lung nodule is present."
+      negative: "No lung nodule is present."
+    - name: "Lung opacity"      
+      positive: "Lung opacity is present."
+      negative: "No lung opacity is present."
+    - name: "Pulmonary fibrotic sequela"      
+      positive: "Pulmonary fibrotic sequela is present."
+      negative: "No pulmonary fibrotic sequela is present."
+    - name: "Pleural effusion"      
+      positive: "Pleural effusion is present."
+      negative: "No pleural effusion is present."
+    - name: "Mosaic attenuation pattern"      
+      positive: "Mosaic attenuation pattern is present."
+      negative: "No mosaic attenuation pattern is present."
+    - name: "Peribronchial thickening"      
+      positive: "Peribronchial thickening is present."
+      negative: "No peribronchial thickening is present."
+    - name: "Consolidation"      
+      positive: "Consolidation is present."
+      negative: "No consolidation is present."
+    - name: "Bronchiectasis"      
+      positive: "Bronchiectasis is present."
+      negative: "No bronchiectasis is present."
+    - name: "Interlobular septal thickening"      
+      positive: "Interlobular septal thickening is present."
+      negative: "No interlobular septal thickening is present."

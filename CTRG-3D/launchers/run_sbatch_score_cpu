@@ -1,0 +1,120 @@
+#!/bin/bash
+# ==============================================================================
+# 이미 생성된 CSV 를 full valid 1,552 에 채점한다. **GPU 를 쓰지 않는다.**
+#
+#   sbatch run_sbatch_score_cpu grpo_newencB base 100 200
+#   sbatch run_sbatch_score_cpu grpo_ab_gamma2 800 1000
+#   bash   run_sbatch_score_cpu grpo_ab_g16 800 1000      # 로그인/계산 노드에서 직접
+#
+# 왜 CPU 인가
+#   evaluate_reportgen.py 는 RadBERT 로 라벨을 읽고 pycocoevalcap 으로 NLG 를 잰다.
+#   infer.py:24 가 `cuda if available else cpu` 라 GPU 가 없어도 그대로 돈다. 그리고
+#   norm 파티션은 CPU 가 수천 개 놀고 있어 대기가 사실상 0 이다 -- a100 을 기다리며
+#   몇 시간~며칠을 쓰는 것과 대조적이다.
+#
+# 왜 컨테이너 밖인가
+#   METEOR 가 java 를 요구하는데 CUDA 이미지에는 java 가 없다(그래서 기존 배치
+#   채점 경로는 METEOR 를 못 냈다). Biowulf 호스트에는 java 1.8 이 있으므로 호스트
+#   venv 로 그냥 돌리면 METEOR 까지 나온다.
+#
+# 생성은 어디서 하나
+#   storm(로컬 DGX)에서 `bash run_storm_generate.sh <mode>` 로 CSV 를 만든다.
+#   storm 의 /mnt/biowulf 는 helix 로의 sshfs 라 여기 results/ 와 같은 파일이다.
+# ==============================================================================
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --job-name ctrg-score-cpu
+#SBATCH --time 8:00:00
+#SBATCH --partition norm
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+set -euo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+VLM3D=$REPO/../VLM3D-Dockers/ct_challenges/reportgen_evaluation
+RADBERT_MODEL=${RADBERT_MODEL:-/data/MIDS/datasets/CT-RATE/models/RadBertClassifier.pth}
+RADBERT_DIR=$VLM3D/assets/radbert_local
+# baseline 과 같은 파일이어야 한다. 다른 split json 은 GT 라벨이 달라진다.
+SPLIT_JSON=/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+PY="$REPO/.venv/bin/python"
+
+SUB="${1:-}"; shift || true
+TAGS=("$@")
+[ -n "$SUB" ] && [ ${#TAGS[@]} -gt 0 ] \
+    || { echo "usage: sbatch $0 <results-subdir> <tag> [tag...]" >&2; exit 1; }
+OUT=$REPO/results/$SUB
+
+# delta 기준선은 그 런의 **출발 정책**이어야 한다.
+#   grpo_newencB : 출발 정책이 newenc B(ckpt-7455) 이므로 같은 배치 경로로 뽑은
+#                  자기 base 를 쓴다. grpo_pilot/base 는 옛 인코더 ep15best 라
+#                  그것을 쓰면 인코더 교체 효과가 RL 효과로 잘못 합산된다.
+#   grpo_ab_*    : 출발 정책이 ep15best 이므로 기존 grpo_pilot/base 를 재사용한다.
+#   textonly_grpo: 출발 정책이 textonly SFT ep11(cap768) 이다. 옛 인코더 ep15best 로
+#                  delta 를 재면 모델 계열 자체가 달라 숫자가 무의미해진다.
+case "$SUB" in
+    grpo_newencB) BASE_METRICS=$OUT/base/vlm3d_eval/metrics.json; BASE_LABEL="$SUB/base (newenc B)" ;;
+    textonly_grpo) BASE_METRICS=$REPO/results/textonly_cap768/checkpoint-16401_cap768/vlm3d_eval/metrics.json
+                  BASE_LABEL="textonly SFT ep11 cap768 (합 1.4142)" ;;
+    textonly_cap768) # textonly SFT(w=10) cap768 계열. 기준선은 그 계열의 best 인 ep11.
+                  BASE_METRICS=$REPO/results/textonly_cap768/checkpoint-16401_cap768/vlm3d_eval/metrics.json
+                  BASE_LABEL="textonly w=10 ep11 cap768 (합 1.4142)" ;;
+    textonly_w5_cap768) # w 축 단일 요인: 같은 데이터/배치/lr/스케줄, label_token_weight 만 5 vs 10.
+                  # 기준선은 같은 epoch(ep11 = checkpoint-16401)의 w=10 판이고, 그것이 w=10 최고이기도 하다.
+                  BASE_METRICS=$REPO/results/textonly_cap768/checkpoint-16401_cap768/vlm3d_eval/metrics.json
+                  BASE_LABEL="textonly w=10 ep11 cap768 (합 1.4142)" ;;
+    *)            BASE_METRICS=$REPO/results/grpo_pilot/base/vlm3d_eval/metrics.json
+                  BASE_LABEL="grpo_pilot/base (ep15best)" ;;
+esac
+
+echo "=============================================================="
+echo " CPU scoring   $(date '+%F %T')   host=$(hostname)  cpus=$(nproc)"
+echo "   OUT  : $OUT"
+echo "   tags : ${TAGS[*]}"
+echo "=============================================================="
+
+fail=0; say(){ printf "  %-4s %s\n" "$1" "$2"; [ "$1" = NO ] && fail=1; return 0; }
+for f in "$PY" "$SPLIT_JSON" "$RADBERT_MODEL" "$RADBERT_DIR/config.json" \
+         "$REPO/src/evaluate_reportgen.py"; do
+    [ -e "$f" ] && say OK "$(basename "$f")" || say NO "missing: $f"
+done
+if [ -e "$BASE_METRICS" ]; then say OK "baseline: $BASE_LABEL"
+elif printf '%s\n' "${TAGS[@]}" | grep -qx base; then say OK "baseline: $BASE_LABEL (이번 런에서 함께 채점)"
+else say NO "baseline 없음: $BASE_METRICS -- tag 목록에 base 를 넣어라"; fi
+command -v java >/dev/null 2>&1 && say OK "java (METEOR)" || say OK "java 없음 -- METEOR 만 빠진다"
+for t in "${TAGS[@]}"; do
+    [ -s "$OUT/${t}.csv" ] && say OK "csv $t ($(( $(wc -l < "$OUT/${t}.csv") - 1 )) rows)" \
+                           || say NO "csv 없음: $OUT/${t}.csv  (storm 에서 run_storm_generate.sh 먼저)"
+done
+[ "$fail" -eq 0 ] || { echo "사전검사 실패" >&2; exit 1; }
+
+cd "$REPO"
+for t in "${TAGS[@]}"; do
+    echo "=============== score: $t ==============="
+    if [ -s "$OUT/$t/vlm3d_eval/metrics.json" ]; then echo "이미 채점됨, 건너뜀"; continue; fi
+    "$PY" src/evaluate_reportgen.py --result_csv "$OUT/${t}.csv" \
+        --split_json_path "$SPLIT_JSON" --out_dir "$OUT/$t/vlm3d_eval" \
+        --radbert_model_path "$RADBERT_MODEL" --radbert_dir "$RADBERT_DIR"
+done
+
+echo "=============== 요약 (base = $BASE_LABEL) ==============="
+"$PY" - "$OUT" "$BASE_METRICS" "${TAGS[@]}" <<'PY'
+import json, os, sys
+out, basep, tags = sys.argv[1], sys.argv[2], sys.argv[3:]
+def read(p):
+    m=json.load(open(p)); c=m['crg']; x=m['classification']['macro']; g=m['generation']
+    return (x['f1'], g['BLEU_mean'], c['CRG'], x['precision'], x['recall'], c['TP'], c['FP'])
+b=read(basep)
+print('%-6s %9s %11s %8s %7s %7s %6s %6s   | dF1       dBLEU      dCRG'
+      % ('tag','macroF1','BLEU_mean','CRG','macroP','macroR','TP','FP'))
+print('%-6s %9.4f %11.5f %8.4f %7.4f %7.4f %6d %6d' % (('base',)+b))
+for t in tags:
+    if str(t) == 'base': continue      # 기준선 자신
+    p=os.path.join(out,str(t),'vlm3d_eval','metrics.json')
+    if not os.path.exists(p): print(f'{t:<6s} (미채점)'); continue
+    r=read(p)
+    print('%-6s %9.4f %11.5f %8.4f %7.4f %7.4f %6d %6d   | %+.4f  %+.5f  %+.4f'
+          % ((str(t),)+r+(r[0]-b[0], r[1]-b[1], r[2]-b[2])))
+print()
+print('판정 문턱: |dBLEU_mean| < 0.007 (2 sigma, docs/2026-08-22-grpo-review.md 12.5)')
+PY
+echo "=============== done ==============="

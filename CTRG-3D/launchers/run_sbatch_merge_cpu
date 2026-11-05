@@ -1,0 +1,78 @@
+#!/bin/bash
+# 라벨 유도 repair 병합 + 채점을 CPU 로만 돌린다 (norm, 큐 대기 0).
+#
+#   sbatch run_sbatch_merge_cpu <OUTTAG> <k> <backbone_idx> <draw> [<draw> ...]
+#     draw = results/ 아래 상대경로 (확장자 없이). 예: grpo_newencB/800
+#
+# 예) sbatch run_sbatch_merge_cpu v11k3 3 6 \
+#        grpo_newencB/700 grpo_newencB/800 ... grpo_B_g3/700
+#
+# 왜 CPU 인가: RadBERT 문장 라벨링도 evaluate_reportgen 도 GPU 를 요구하지 않는다
+# (infer.py:24 가 cuda if available else cpu). a100 을 기다리는 대신 norm 에서 즉시 돈다.
+# 왜 컨테이너 밖인가: METEOR 가 java 를 요구하는데 CUDA 이미지에는 java 가 없다.
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --job-name ctrg-merge-cpu
+#SBATCH --time 8:00:00
+#SBATCH --partition norm
+#SBATCH --cpus-per-task=32
+#SBATCH --mem 100g
+set -euo pipefail
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+VLM3D=$REPO/../VLM3D-Dockers/ct_challenges/reportgen_evaluation
+SPLIT_JSON=/data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+RADBERT_MODEL=${RADBERT_MODEL:-/data/MIDS/datasets/CT-RATE/models/RadBertClassifier.pth}
+[ -s "$RADBERT_MODEL" ] || RADBERT_MODEL=$REPO/data/radbert/RadBertClassifier.pth
+RADBERT_DIR=$VLM3D/assets/radbert_local
+PY="$REPO/.venv/bin/python"
+cd "$REPO"
+
+[ $# -ge 5 ] || { echo "usage: sbatch $0 <OUTTAG> <k> <backbone_idx> <draw>..." >&2; exit 1; }
+TAG="$1"; K="$2"; BB="$3"; shift 3
+
+# 병합 결과는 언제나 grpo_newencB 아래에 둔다 -- 랭킹 스캐너와 기존 수치가 그 경로다.
+OUTDIR="$REPO/results/grpo_newencB"
+OUT="$OUTDIR/$TAG.csv"
+
+CSVS=(); for d in "$@"; do
+  c="$REPO/results/$d.csv"
+  lab="$REPO/results/$d/vlm3d_eval/inferred_labels.csv"
+  [ -s "$c"   ] || { echo "no CSV: $c" >&2; exit 1; }
+  [ -s "$lab" ] || { echo "no inferred_labels (먼저 채점해야 한다): $lab" >&2; exit 1; }
+  CSVS+=("$c")
+done
+[ "$BB" -lt "${#CSVS[@]}" ] || { echo "backbone_idx $BB >= draw 수 ${#CSVS[@]}" >&2; exit 1; }
+
+echo "=============================================================="
+echo " merge  tag=$TAG  k=$K  backbone=$BB (${CSVS[$BB]##*/PETRG-3D/results/})"
+echo " draws(${#CSVS[@]}): $*"
+echo " $(date '+%F %T')  host=$(hostname)"
+echo "=============================================================="
+
+CACHE="${LABEL_CACHE:-$REPO/data/tmp_sentlab_${TAG}.npz}"
+MAXADD_ARG=""; [ "${MAX_ADD:-0}" != 0 ] && MAXADD_ARG="--max_add ${MAX_ADD}"
+[ "${DROP_REDUNDANT:-0}" = 1 ] && MAXADD_ARG="$MAXADD_ARG --drop_redundant"
+[ "${MAX_DROP_RED:-0}" != 0 ] && MAXADD_ARG="$MAXADD_ARG --max_drop_redundant ${MAX_DROP_RED}"
+[ "${BB_PER_EXAM:-0}" = 1 ] && MAXADD_ARG="$MAXADD_ARG --backbone_per_exam"
+[ -n "${MAX_ADD_IMP:-}" ] && MAXADD_ARG="$MAXADD_ARG --max_add_impression ${MAX_ADD_IMP}"
+[ "${BB_MARGIN:-0}" != 0 ] && MAXADD_ARG="$MAXADD_ARG --bb_margin ${BB_MARGIN}"
+echo " label_cache=$CACHE  max_add=${MAX_ADD:-0(무제한)}"
+$PY scripts/label_guided_merge.py --draws "${CSVS[@]}" \
+    --min_support "$K" --mode repair --backbone "$BB" $MAXADD_ARG \
+    --label_cache "$CACHE" --out "$OUT" \
+    --radbert_model_path "$RADBERT_MODEL" --radbert_dir "$RADBERT_DIR"
+
+$PY src/evaluate_reportgen.py --result_csv "$OUT" --split_json_path "$SPLIT_JSON" \
+    --out_dir "$OUTDIR/$TAG/vlm3d_eval" \
+    --radbert_model_path "$RADBERT_MODEL" --radbert_dir "$RADBERT_DIR"
+
+$PY - "$OUTDIR/$TAG/vlm3d_eval/metrics.json" <<'PYEOF'
+import json,sys
+m=json.load(open(sys.argv[1])); c=m['crg']; x=m['classification']['macro']; g=m['generation']
+s=c['CRG']+x['f1']+g['BLEU_mean']
+print(f"\n  CRG {c['CRG']:.4f}  macroF1 {x['f1']:.4f}  BLEU {g['BLEU_mean']:.5f}  ==> sum {s:.4f}")
+print(f"  P {x['precision']:.3f}  R {x['recall']:.3f}  TP {c['TP']}  FP {c['FP']}"
+      f"  BLEU4 {g['BLEU_4']:.4f}  ROUGE_L {g['ROUGE_L']:.4f}")
+print(f"  현재 1위 800_x5b4 = 1.5307 (CRG .5668 / F1 .6066 / BLEU .35734)")
+print(f"  BLEU 하한 0.3194 미만이면 폐기한다")
+PYEOF
+echo "=============== done ==============="

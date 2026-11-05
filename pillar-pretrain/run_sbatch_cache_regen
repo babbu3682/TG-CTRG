@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Text-embedding cache regeneration (last-token pooling fix) for train + val, moved off the
+# interactive node (cn0075, which was about to time out) into a proper sbatch job so it survives.
+# cache_ctrate_embeddings_phrase_align.py skips samples that are already cached (force_regenerate
+# defaults to False), so this picks up right where the interactive-node run left off.
+
+#SBATCH --job-name cache_regen_lasttoken
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --time 12:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+module load singularity
+cd /vf/users/drdcad/sunggu/0.Challenge/pillar-pretrain
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "uv run python scripts/cache_ctrate_embeddings_phrase_align.py \
+      --model-name /data/drdcad/sunggu/llm_models/Qwen3-Embedding-8B \
+      --json-file /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_train_filtered_prob_half.json \
+      --cache-dir /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/text_cache_qwen3_embedding_8b_phrase/train \
+      --batch-size 64 --num-processes 1 --device cuda --verbose"
+
+echo "=== TRAIN CACHE DONE, STARTING VAL CACHE ==="
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "uv run python scripts/cache_ctrate_embeddings_phrase_align.py \
+      --model-name /data/drdcad/sunggu/llm_models/Qwen3-Embedding-8B \
+      --json-file /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json \
+      --cache-dir /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/text_cache_qwen3_embedding_8b_phrase/val \
+      --batch-size 64 --num-processes 1 --device cuda --verbose"
+
+echo "=== VAL CACHE DONE ==="

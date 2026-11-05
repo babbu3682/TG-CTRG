@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# sacct -r gpu -S 2026-06-01 --format=JobID,JobName%20,Partition,State,Start,End,ExitCode,NodeList | grep pilar0_nih
+# 우선 순위 : squeue -p gpu --state=PENDING --sort=-p | grep -n "$USER"
+# GPU 체크  : srun --overlap nvidia-smi --jobid=22705318
+# sjobs --no-column-limit
+
+# tail -f ${LOG_DIR:-./logs}/lapa_d3g2-
+
+# SBatch Logging and mailing
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+
+########## SBatch Reservation and runtime : gpu (a100) 스펙: Cores 32, CPUs 64, GPUs 4, Mem 243g
+
+# (A100 1~3개 쓸 때) -- phrase_align / phrase_align_split 과 동일한 자원/시간
+
+#SBATCH --job-name lapa_d3g2
+#SBATCH --time 3-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:2
+#SBATCH --cpus-per-task=32         # GPU 1개당 할당 가능한 최대 CPU(14개) 요청, 2개면 2*16=32개 요청.
+#SBATCH --mem 120g                 # GPU 4개가 연결된 a100 서버에 할당된 메모리 243g, 그중 243//2 = 120g 요청
+
+
+# 현재 컨테이너/노드에서 사용 가능한 실제 CPU 코어 수를 자동 계산하여 변수에 할당
+AVAILABLE_CPUS=$(nproc)
+echo "자동으로 계산된 CPU 개수: $AVAILABLE_CPUS"
+
+
+# Define Variables
+export WANDB_API_KEY="${WANDB_API_KEY:?set WANDB_API_KEY or use WANDB_MODE=offline}"
+
+module load singularity
+
+
+# Start container with Singularity
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "bash /data/drdcad/sunggu/0.Challenge/pillar-pretrain/train_unimodal_pillar0_ctrate_chest_ct_1node_lapa.sh"

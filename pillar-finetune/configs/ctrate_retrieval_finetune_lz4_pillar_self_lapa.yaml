@@ -1,0 +1,307 @@
+# CTRATE retrieval — 인코더를 `lapa`(abn 전체 1등 체크포인트)로 교체한 런.
+#
+# 체크포인트: lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt
+#   (pretrain val_loss 최저 6.5927 / 50 epoch, abn maxpool 런에서 val macro AUROC 0.8730
+#    = 통합 순위 전체 1등, 기존 승자 오픈소스 probe 0.8692를 넘음. job 27744448 참고)
+#
+# 참고 대상 두 개 (둘 다 gallery는 lasthidden으로 정합):
+#   오픈소스 Pillar0-ChestCT : job 26978948, ep48, match_recall@1 0.2173 / report_f1 0.1545
+#   phrase_align_split ep10      : job 27309852, ep29 best, match_recall@1 0.1937 / report_f1 0.1382
+#
+# ⚠️ **val_loss는 위 두 런과 비교하면 안 된다.** `pillar/losses/retrieval_loss.py`가
+# 2026-08-16 22:42에 수정됐고(DB re-balance 항 복원, NTR bias 순서 수정,
+# sim_reduction "sample"->"pair", avg_pos 15.3), 위 두 job은 그보다 앞서 끝났다
+# (26978948: 08-13 02:16 / 27309852: 08-16 04:55). 즉 **목적함수 자체가 다르므로
+# val_loss 절대값은 세 런 사이에 의미가 없다.** 반면 gallery 기반 지표
+# (match_recall@k / sample_recall@k / report_f1)는 loss와 무관하게 계산되므로 그대로
+# 비교 가능하다 — 이 런의 결론은 recall/f1로 내릴 것.
+# (이 런이 수정된 loss로 도는 최초의 retrieval 런이기도 하다.)
+#
+# 이 config가 phrase_align_split 버전과 다른 곳은 backbone 블록 + head `input_dim`(1152->384)
+# 두 군데뿐이다. input_dim은 선택이 아니라 **인코더가 강제하는 값**이다: lapa의
+# vision tower는 3-scale concat을 하지 않고 단일 스케일(scale_index=1)만 내보내므로
+# activ가 (B, 384, 16, 8, 8) = 1,024 토큰이다(다른 self 런은 (B,1152,32,32,32)).
+# head의 나머지(d_model 1152, d_target 4096 raw Qwen, num_queries 64, 6 layers,
+# post-LN, aux_loss False) / loss / optimizer / batch 10 / 50 epoch / patience 8 /
+# clip_grad 0.1 / augmentation / text_cache / gallery는 전부 기준선과 동일하게 유지한다.
+#
+# `configs/ctrate_retrieval_finetune_lz4_pillar_opensource_scale1.yaml`이 제안했던 다른
+# 두 변경((B) 타깃/gallery를 text.proj 1152 공간으로, (C) decoder pre-LN)은 **의도적으로
+# 채택하지 않았다** — 아직 어떤 런으로도 검증된 적이 없고(그 config는 한 번도 완주하지
+# 않았다), 인코더 교체와 동시에 바꾸면 무엇이 효과를 냈는지 분리할 수 없다.
+#
+# 텍스트 쪽은 last-token으로 통일돼 있다(실측 2026-08-13):
+#   text_cache_qwen3_embedding_8b_phrase/{train,val}  — max_length 2048 / key_phrase 256
+#   cos(text_cache, gallery_embeddings_lasthidden.pt) = 0.9999  (mean-pool 쪽은 0.31)
+# gallery 경로는 아래 metrics 블록에서 lasthidden으로 지정돼 있다.
+
+experiment:
+  name: CTRATE_FT_Atlas_retrieval_self_lapa
+  tags: ["ctrate", "atlas", "retrieval", "pillar0-self-lapa", "scale1", "lz4", "lasttoken"]
+  notes: "Retrieval with the lapa self-pretrained encoder (lapa_pillar0_lz4_v1/epoch_12, frozen, eval-pinned -- the checkpoint that won abn outright at 0.8730): single-scale activ (B,384,16,8,8)=1024 tokens from the stride-corrected stem -> Simple_TranSQ(input_dim 384, d_model 1152, d_target 4096), last-token text cache + last-token gallery. Encoder-only swap vs opensource baseline (job 26978948, match_recall@1 0.2173) and phrase_align_split (job 27309852, 0.1937). NOTE: first retrieval run on the corrected TranSQLoss (2026-08-16), so val_loss is NOT comparable to those two -- compare recall@k/report_f1."
+
+main:
+  exp_name: CTRATE_FT_Atlas_retrieval_self_lapa
+  seed: 42
+  log_dir: ./logs
+  checkpoints_dir: ./logs/CTRATE
+  timestamp_save_dir: False
+
+  disable_wandb: False
+  wandb_offline: False
+  wandb_project: null
+  wandb_entity: null
+
+  ckpt_freq: 1
+  # monitor는 val_loss 유지. 논문 부록 D("best model determined by validation
+  # loss")와 참조 코드(ct_rrg_v12.yaml: metric_for_best_model: eval_loss)가 둘 다
+  # val_loss를 쓴다. 08-16에 val_sample_recall@10으로 바꿨다가 되돌렸다 — recall류는
+  # epoch 간 진동 폭이 ±0.004라 best.ckpt가 노이즈 봉우리를 집을 수 있고, 논문·참조·
+  # 기존 기준선 어디에도 근거가 없었다. 대신 ckpt_freq: 1로 전 epoch을 보존하고
+  # 최종 체크포인트 선택만 사후에 val_sample_recall@10으로 한다(참조 코드가
+  # save_total_limit: null로 쓰는 것과 같은 패턴).
+  monitor: val_loss
+
+  allow_overwriting_experiment_checkpoints: True
+  # Simple_TranSQ의 decoder(6 layers)는 aux_loss/return_intermediate 여부와 무관하게
+  # forward에서 모든 layer가 무조건 순차 실행되므로(pillar/models/heads/detr.py의
+  # TransformerDecoder.forward 참고) 실제로 매 스텝 unused parameter가 생기지 않는다.
+  # True로 두면 DDP가 매 backward마다 autograd 그래프를 순회해 unused param을 찾는
+  # 불필요한 오버헤드가 붙는다.
+  find_unused_parameters: False
+  force_loading_train_dataloader: False
+
+  phases:
+    train: True
+    dev: True
+    test: True
+
+  freeze_backbone: "True"
+
+  # Stop once val_loss hasn't improved for this many consecutive epochs.
+  early_stopping_patience: 8
+
+engine:
+  type: Retrieval
+  max_epochs: 50
+  kwargs:
+    resume: null
+    accumulate_grad_batches: 1
+    precision: bf16-mixed
+    binary_pred: True
+    log_loss_components: True
+    log_interval: 50
+    limit_num_batches: null
+    use_gpu_augs: True
+    train_gpu_augs:
+      - type: RandomRotation3D
+        kwargs:
+          degrees: [0.0, 0.0, 20.0]
+    test_gpu_augs: []
+
+dataloader:
+  batch_size: 10
+  eval_batch_size: 10
+  num_workers: 4
+  class_bal: False
+  train_drop_last: True
+  val_drop_last: False
+  multi_gpu_eval: True
+  persistent_workers: True
+  prefetch_factor: 2
+  # DETR류 decoder + Hungarian matching은 학습 초반 매칭이 요동칠 때 gradient가 크게 튈 수
+  # 있어 원 DETR 논문도 clip_max_norm=0.1을 씀. 지금까지 clip 없이 돌리고 있었던 부분.
+  clip_grad: 0.1
+  no_shuffle_training_set: False
+  use_null_collate: False
+  frac_train_samples: 1.0
+  no_cache_misses_allowed: False
+
+dataset:
+  type: CTRATE_RET_Dataset
+  modality: CT
+  num_classes: 18
+  mode: "retrieval"
+
+  shared_dataset_kwargs:
+    anatomy: "chest_ct"
+    windows: 'all'
+    target_d: 256
+    target_hw: 256
+    pad_value: -1024
+    rve_root: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/
+    # 환자당 key phrase 최대 49개(평균 15개) 관측됨 (pillar/losses/retrieval_loss.py 주석 참고).
+    # GT 임베딩 자체는 activ spatial map(수GB)에 비해 메모리 비용이 무시할 만큼 작아서
+    # truncate로 얻는 메모리 이득은 사실상 없다 — 완전히 무제한으로 두지 않는 이유는
+    # multi-GPU NCCL all_gather가 랭크 간 동일 텐서 shape을 요구하기 때문에 "전역 고정
+    # 상한"이 필요해서다. num_queries(=64)와 동일하게 맞춰서, 실제 관측된 최대치(49)까지는
+    # 절대 안 잘리고, 그 이상은 어차피 Hungarian 매칭이 num_queries개까지만 쓸 수 있어
+    # 의미가 없다. (문장 수가 이 값을 넘는 샘플이 있으면 dataset이 warning을 남긴다.)
+    max_sentences: 64
+
+  dataset_train_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_train_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/train/mapping_path.csv
+    is_train: True
+    text_cache_dir: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/text_cache_qwen3_embedding_8b_phrase/train
+  dataset_dev_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    text_cache_dir: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/text_cache_qwen3_embedding_8b_phrase/val
+  dataset_test_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    text_cache_dir: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/text_cache_qwen3_embedding_8b_phrase/val
+
+
+model:
+  type: MultiStage
+  kwargs:
+    # pool_name/pool_kwargs 제거: 아래 retrieval head는 apply_pooling=False,
+    # use_pooled_features=False라 pool 출력을 전혀 쓰지 않는다. MultiAttentionPool을
+    # 지정해두면 그 파라미터는 학습 내내 gradient를 한 번도 못 받는데, DDP는 forward에
+    # 안 쓰였다는 이유만으로 이걸 "Expected to have finished reduction..." 에러로 잡아낸다
+    # (find_unused_parameters=True로 우회할 수도 있지만, 그러면 죽은 파라미터가 optimizer
+    # state/checkpoint에 계속 남으므로 애초에 안 쓰는 pool을 지정하지 않는 게 맞다).
+    # pool_name을 생략하면 파라미터가 없는 기본값 GlobalMaxPool로 떨어진다.
+    # self-pretrained raw .pt이고, 게다가 `lapa` 변형이므로 전용 백본
+    # MultimodalAtlasSelfLAPA를 쓴다(abn 1등 런 job 27744448과 동일한 클래스):
+    #   - stride 교정 stem ChestCTEmbed3D_Pillar0 (patch [8,8,4] -> (D,H,W)=(64,32,32))
+    #   - 단일 스케일 readout (scale_index=1)
+    # model_config는 pretrain 쪽 실제 학습 config
+    # (model_configs/...__pillar0_multimodal_ucsf_chest_ct_multiwindow_lapa.json)에서
+    # 그대로 가져온 값 — 하나라도 어긋나면 setup_model()이 missing/unexpected 키로 즉시 에러.
+    #
+    # ⚠️ activ grid가 다른 런들과 다르다: 이 백본은 3-scale concat을 하지 않고 스케일 1의
+    # native 토큰만 내보내므로 **(B, 384, 16, 8, 8) = 1,024 토큰**이다
+    # (phrase_align_split은 (B,1152,32,32,32)=32,768, 오픈소스는 (B,1152,32,32,64)=65,536).
+    # Simple_TranSQ는 grid를 입력 텐서 shape에서 런타임에 읽어 shape별로 pos_embed를
+    # 캐싱하므로(transq.py의 _pos_embed_cache) 코드 수정 없이 대응된다. 부수 효과로
+    # decoder cross-attention의 memory 길이가 32배 짧아 epoch당 시간이 크게 줄어든다.
+    backbone_model_type: MultimodalAtlasSelfLAPA
+    backbone_kwargs:
+      embed_dim: 384
+      image_size: 256
+      multiscale_feats: True
+      # 중간 hidden: 스케일 1(1024 토큰)만 readout — pretrain tower의 기본값과 동일.
+      scale_index: 1
+      pretrained: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/logs/lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt
+      model_config:
+        modalities:
+          chest_ct:
+            image_size: [256, 256, 256]
+            in_chans: 11
+            local2global: [4, 4, 4]
+            merge_ratio: [4, 4, 4]
+            num_features: 192
+            patch_size: [8, 8, 4]
+        model:
+          atlas_args:
+            attn_drop: 0.0
+            class_token: False
+            dim: 384
+            drop: 0.0
+            drop_path_rate: 0.3
+            embed_dim: 384
+            global_pool: avg
+            in_chans: 1
+            in_dim: 64
+            mlp_ratio: 4.0
+            num_classes: 0
+            num_features: 192
+            num_heads: 6
+            num_scales: 3
+            pre_norm: False
+            qk_scale: False
+            qkv_bias: True
+          stages: [2, 2, 8]
+
+    head_models:
+      retrieval:
+        type: Simple_TranSQ
+        kwargs:
+          # 384 = 스케일 1의 native 채널 수(atlas_args.dim). 선택이 아니라 이 인코더가
+          # 강제하는 값 — activ가 (B,384,16,8,8)이므로 input_proj의 in_channels가 384다.
+          # d_model/d_target/num_queries/layers/post-LN은 기준선과 동일하게 유지한다.
+          input_dim: 384
+          d_target: 4096
+          num_queries: 64
+          num_decoder_layers: 6
+          aux_loss: False
+        apply_pooling: False
+        use_pooled_features: False
+        enable_at_eval: True
+
+
+optimizer:
+  type: AdamW
+  kwargs:
+    lr: 1.0e-4  # DETR decoder를 from-scratch로 학습할 때 쓰는 표준값, 그대로 유지
+    weight_decay: 0.01  # decoder+FFN이 파라미터 수가 꽤 되는데 wd=0.0이라 과적합 방지가 없었음
+
+  scheduler:
+    interval: epoch
+    frequency: 1
+    type: CosineAnnealingWarmup
+    kwargs:
+      min_lr: 1.0e-5
+      warmup_epochs: 4
+      max_epochs: 50
+
+  layer_decay: 0.9
+
+metrics:
+  epoch_metrics:
+    # train split에서는 epoch metric을 끔: 켜두면 train_one_epoch이 4637 batch 내내
+    # (sent_feats, sent_embeds 등 (B,64,4096) 텐서를) CPU RAM에 계속 쌓아뒀다가 epoch
+    # 끝에만 비우는데, 이게 배치당 ~17MB씩 4637번 쌓이면 80~90GB에 달해서 SLURM
+    # --mem 120g를 넘겨 SIGKILL(oom_kill)로 죽었다. train_loss는 step 단위로 이미
+    # wandb에 로깅되고 있고, retrieval 품질(recall@k 등)은 val/test로 모니터링하면
+    # 충분하므로 train에서는 끈다.
+    train: []
+    val: &base_metrics
+      - type: RetrievalMetric
+        kwargs:
+          logit_key: retrieval
+          sent_feats_key: sent_feats
+          topic_preds_key: topic_preds
+          target_embeds_key: sent_embeds
+          target_len_key: sent_num
+          # gallery는 위 text_cache_dir과 반드시 같은 텍스트 임베딩 공간이어야 한다.
+          # 같은 79,166 문장(gallery_sentences.pt, 순서 동일)에 대해 두 gallery가 있다:
+          #   gallery_embeddings.pt            — mean-pool  Qwen3-Embedding-8B (7/27 생성)
+          #   gallery_embeddings_lasthidden.pt — last-token Qwen3-Embedding-8B
+          # 문장별 코사인이 평균 0.31뿐이라 잘못 짝지으면 recall@k가 모델이 아니라
+          # 공간 불일치를 측정한다. 실측(2026-08-13, 샘플의 GT key_phrase 임베딩을
+          # text_cache에서 직접 꺼내 같은 문장의 gallery 행과 대조):
+          #   train cache: cos(mean-pool)=0.3093  cos(lasthidden)=0.9999
+          #   val   cache: cos(mean-pool)=0.3183  cos(lasthidden)=0.9999
+          # 즉 현재 text_cache는 last-token이므로 lasthidden gallery가 정답이다.
+          # (2026-08-13 수정 전까지 mean-pool 경로를 가리키고 있어서, job 26947705 /
+          #  26978948의 학습 로그에 찍힌 recall@k·MRR·report_f1이 전부 무효다 —
+          #  val_loss는 gallery를 안 거치므로 영향 없고 모델 선택은 유효하다.)
+          gallery_embeddings: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune/data/gallery_embeddings_lasthidden.pt
+          gallery_sentences: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune/data/gallery_sentences.pt
+    dev: *base_metrics
+    test: *base_metrics
+
+  losses:
+    - type: TranSQLoss
+      weight: 1.0
+      kwargs:
+        logit_key: retrieval
+        sent_feats_key: sent_feats
+        topic_preds_key: topic_preds
+        target_embeds_key: sent_embeds
+        target_len_key: sent_num
+        sim_weight: 1.0
+        cls_weight: 1.0
+        contrastive_weight: 0.1      # λ (논문 4.3)
+        match_mu: 0.5                # μ (논문 4.3)
+        cls_loss_type: db            # 논문 기본
+        num_queries: 64             # 모델과 반드시 일치
+        avg_pos_queries: 15.3        # DB prior. 실측 2026-08-16: train 15.286 / valid 15.206
+        use_neftune: True
+        gamma: 2.0

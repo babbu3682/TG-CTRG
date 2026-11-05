@@ -1,0 +1,101 @@
+#!/bin/bash
+# ==============================================================================
+# GRPO-on-newencB 의 참조 산출물. 캐시 job 이 끝난 뒤 한 번만 돌린다.
+#
+#   sbatch --dependency=afterok:<cache jobid> run_sbatch_grpo_ref_newencB
+#
+# 이 job 하나가 세 가지를 **같은 생성물에서** 만든다. 따로 뽑으면 서로 어긋나고,
+# 그러면 보상이 자기가 포함되지 않은 코퍼스에 대해 rollout 을 채점한다 -- 1회차
+# 파일럿이 정확히 그렇게 망했다 (docs/2026-08-25-grpo-improvements.md 1).
+#
+#   1. BLEU paired floor   볼륨별 시작 정책(B)의 BLEU
+#   2. macro-F1 코퍼스     B 가 subset 에 실제로 낸 예측 라벨 (운영점)
+#   3. sigma 3종           그 코퍼스에서 재측정한 sigma_s / sigma_f1 / sigma_bleu
+#
+# **round 2 의 data/grpo_ref_crgf1bleu/reference.json 을 재사용하면 안 된다.**
+# 그것은 ep15best(옛 인코더)가 8,000 볼륨에 낸 예측으로 만든 것이다. B 는 동작점이
+# 다르다 (주장한 양성 +25% vs -13%, macro-F1 0.5187 vs 0.4528) -> floor 도 코퍼스도
+# sigma 도 전부 달라진다.
+#
+# --split train_newenc: B 가 학습한 lapa 템플릿 + gtcov split 으로 프롬프트를
+# 만든다. 옛 템플릿(p90n20 / pillar_freeze)을 주면 B 가 본 적 없는 프롬프트가 된다.
+#
+# WALLTIME: 12,000 볼륨 x 실측 1.42 s/vol = 4.7 h. 8 h 여유.
+#
+# 마감(2026-08-30)이 촉박하면 sbatch 대신 sinteractive 에서 `bash` 로 그대로 돌려라 --
+# 이 스크립트는 SLURM 변수를 쓰지 않는다. 큐 대기가 critical path 에서 사라진다.
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --job-name ctrg-grpo-ref-newencB
+#SBATCH --time 8:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+set -euo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+CKPT="${CKPT:-${REPO}/scripts/outputs/preserved/newencB_ep15_ckpt7455}"
+CACHE="${CACHE:-${REPO}/data/vision_cache/$(basename "${CKPT}")}"
+YAML="${REPO}/src/Model/ctrate_pillar0_chest_lapa.yaml"
+REF=${REPO}/data/grpo_ref_newencB
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+
+echo "=============================================================="
+echo " GRPO-on-newencB reference       $(date '+%F %T')"
+echo "   checkpoint : ${CKPT}"
+echo "   cache      : ${CACHE}"
+echo "   out        : ${REF}"
+echo "=============================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+for f in "${CACHE}/train.npy" "${CACHE}/train_index.json" "${CACHE}/train_meta.json" \
+         "${CKPT}/model.safetensors" "$YAML" \
+         "/data/MIDS/datasets/CT-RATE/models/RadBertClassifier.pth"; do
+    [ -s "$f" ] || { echo "missing: $f -- run run_sbatch_cache_newencB first" >&2; exit 1; }
+done
+for fl in --names_json --cache_dir --model_config_yaml --vis_dim --split; do
+    grep -q -- "add_argument(\"${fl}\"" "$REPO/scripts/generate_batched.py" \
+        || { echo "flag not in scripts/generate_batched.py: $fl" >&2; exit 1; }
+done
+grep -q '"train_newenc"' "$REPO/scripts/generate_batched.py" \
+    || { echo "generate_batched.py has no train_newenc split" >&2; exit 1; }
+
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+module load singularity
+run() {
+    singularity exec --nv -B /vf,/data,/spin1 \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
+        "$SIF" bash -lc "source ${REPO}/.venv/bin/activate && cd ${REPO} && $*"
+}
+
+echo "=============== stage 1/3: subset 12,000 고정 ==============="
+if [ -s "${REF}/subset12000.json" ]; then
+    echo "이미 있음, 건너뜀: ${REF}/subset12000.json"
+else
+    run "python scripts/make_grpo_subset_newencB.py"
+fi
+
+echo "=============== stage 2/3: 시작 정책(B)으로 subset 생성 ==============="
+if [ -s "${REF}/ref_train12000.csv" ]; then
+    echo "이미 있음, 이어서 진행: ${REF}/ref_train12000.csv"
+fi
+run "python scripts/generate_batched.py \
+        --ckpt '${CKPT}' --cache_dir '${CACHE}' \
+        --model_config_yaml '${YAML}' --vis_dim 384 \
+        --split train_newenc --names_json '${REF}/subset12000.json' \
+        --batch_size ${REF_BATCH:-32} --out '${REF}/ref_train12000.csv'"
+
+echo "=============== stage 3/3: floor + corpus + sigma ==============="
+run "python scripts/build_grpo_reference_crgf1bleu.py \
+        --pred_csv '${REF}/ref_train12000.csv' \
+        --subset_json '${REF}/subset12000.json' \
+        --subset_meta '${REF}/subset12000_meta.json' \
+        --out '${REF}/reference.json'"
+
+ls -la "${REF}/"
+echo "=============== done  $(date '+%F %T') ==============="

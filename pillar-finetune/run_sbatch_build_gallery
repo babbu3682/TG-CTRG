@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Rebuilds the retrieval gallery with last-token pooling (scripts/build_gallery_lasttoken.py).
+# See that script's docstring / CLAUDE.md "retrieval gallery_embeddings.pt가 mean-pool로
+# 만들어져 있음" for why: the existing data/gallery_embeddings.pt was built 7/27 (before the
+# 8/7 mean-pool->last-token switch) and was verified to still be mean-pooled, which makes the
+# gallery-based RetrievalMetric (recall@k etc.) numbers for the last-token retrieval run
+# (job 26978948) untrustworthy -- val_loss is unaffected (RetrievalLoss never touches the
+# gallery), only the epoch-level RetrievalMetric.
+#
+# Output: data/gallery_embeddings_lasthidden.pt (new file; gallery_embeddings.pt is left
+# untouched since the mean-pool run, job 26947705, still needs it).
+#
+# 1-day walltime on purpose, not because the job needs anywhere near that long (79,166 short
+# sentences at the smoke-tested throughput should take well under an hour) -- short --time
+# gets better backfill priority on this cluster (see today's finetune_abn_jepa walltime
+# lesson: 9d->5d moved a job from PD(Priority) to scheduled almost immediately).
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+#SBATCH --job-name build_gallery_lasttoken
+#SBATCH --time 1-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+#SBATCH --ntasks=1
+
+module load singularity
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "cd /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune && .venv/bin/python scripts/build_gallery_lasttoken.py"
+
+
+########## 제출 기록
+
+# sbatch run_sbatch_build_gallery
+#   -> job 확인은 squeue/sacct -j <id>로. 결과: data/gallery_embeddings_lasthidden.pt

@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# abn 1등 인코더(lapa_pillar0_lz4_v1/epoch_12)의 pooled feature를 캐싱한다.
+# 목적: 클래스별 임계값(scripts/tune_abn_thresholds.py)과 cls_report 템플릿
+# (scripts/build_cls_report_templates.py)을 이 인코더 기준으로 다시 적합하기 위함.
+#
+# probe 계열과 달리 head를 새로 학습하지 않는다 — CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool
+# 의 best.ckpt(epoch 39)에서 이미 뽑아 놓은 head를 쓴다:
+#   <cache>/finetune_head.pt  (Sequential 인덱스 0/3 레이아웃으로 remap, 384->1024->18)
+# 그래서 train_abn_probe.py를 부르지 않는다.
+#
+# 이 config는 freeze_backbone: True + use_gpu_augs: False라 샘플당 pooled feature가
+# 고정이고, extract 스크립트가 split과 무관하게 center-crop을 강제하므로 추론 시점과
+# 동일한 feature가 나온다.
+#
+# dev를 먼저 뽑는 이유: 1,552례는 몇 분이라 곧바로 test.pth(저장된 best.ckpt logit)와
+# 대조해 dev macro AUROC 0.8729가 재현되는지 확인할 수 있다. train(23,869)은 그 뒤.
+
+# SBatch Logging and mailing
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+########## SBatch Reservation and runtime : gpu (a100)
+
+#SBATCH --job-name abn_extract_lapa
+#SBATCH --time 08:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+AVAILABLE_CPUS=$(nproc)
+echo "자동으로 계산된 CPU 개수: $AVAILABLE_CPUS"
+
+TAG="lapa_lz4_half"
+CONFIG="configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml"
+
+module load singularity
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "cd /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune && \
+        uv run scripts/extract_abn_features.py $CONFIG --tag $TAG --splits dev,train"

@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name=ctrg-vgen
+#SBATCH --partition=interactive
+#SBATCH --gres=gpu:a100:3
+#SBATCH --cpus-per-task=45
+#SBATCH --mem=180g
+#SBATCH --time=1-00:00:00
+#SBATCH --output=${LOG_DIR:-./logs}/ctrg-vgen-%j.out
+# vision(newenc-B 계보) draw 생성기.  아직 draw 가 없는 RL 체크포인트를 뽑는다.
+#
+#   sbatch run_sbatch_vgen grpo_newencB:1500 grpo_newencB:1500_t10p95 \
+#                          grpo_B_a2lam05from900:1500 ...
+#
+# 항목 = <run>:<tag>.  tag 의 접미사가 샘플러를 정한다(기존 draw 규약 그대로):
+#   (없음)          기본 샘플러  T0.7 / top_p 0.9 / rep 1.05
+#   _rep100         rep 1.00
+#   _t10p95         T1.0 / top_p 0.95
+#   _rep100_t10p95  둘 다
+# 출력은 results/<run>/<tag>.csv.  채점은 sbatch run_sbatch_score_cpu <run> <tag>.
+#
+# 새 파일인 이유: run_sbatch_grpo_score_newencB 는 grpo_newencB 한 런에 고정돼 있고
+# 그것이 낸 수치의 재현 경로다.  건드리지 않는다.
+set -uo pipefail
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+CKPT="${CKPT:-${REPO}/scripts/outputs/preserved/newencB_ep15_ckpt7455}"
+CACHE="${CACHE:-${REPO}/data/vision_cache/$(basename "${CKPT}")}"
+YAML="${REPO}/src/Model/ctrate_pillar0_chest_lapa.yaml"
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+BATCH="${BATCH:-32}"
+cd "$REPO" || exit 1
+say(){ echo "$(date '+%F %H:%M:%S') $*"; }
+[ $# -ge 1 ] || { echo "usage: sbatch $0 <run>:<tag> [...]" >&2; exit 1; }
+
+# ---- 사전검사: 어댑터를 존재가 아니라 실제로 열어서 확인한다 ----------------
+# safetensors 는 권한 거부를 FileNotFoundError 로 보고하므로 -f 검사로는 못 잡는다.
+ITEMS=(); for it in "$@"; do
+    run="${it%%:*}"; tag="${it##*:}"
+    ck="${tag%%_*}"
+    a="$REPO/outputs/$run/checkpoint-$ck/adapter_model.safetensors"
+    if ! head -c 8 "$a" >/dev/null 2>&1; then
+        say "SKIP $it : 어댑터를 읽을 수 없다 ($a)"; continue
+    fi
+    if [ -s "$REPO/results/$run/$tag.csv" ]; then say "SKIP $it : CSV 이미 있음"; continue; fi
+    mkdir -p "$REPO/results/$run" 2>/dev/null; chmod 2770 "$REPO/results/$run" 2>/dev/null
+    ITEMS+=("$it")
+done
+[ ${#ITEMS[@]} -gt 0 ] || { say "돌릴 항목이 없다"; exit 0; }
+
+NG=$(nvidia-smi -L 2>/dev/null | wc -l); [ "$NG" -ge 1 ] || NG=1
+say "GPU ${NG} 장 · 항목 ${#ITEMS[@]} 개: ${ITEMS[*]}"
+
+module load singularity 2>/dev/null || true
+flags(){ case "$1" in
+    *_rep100_t10p95) echo "--repetition_penalty 1.00 --temperature 1.0 --top_p 0.95";;
+    *_rep100)        echo "--repetition_penalty 1.00";;
+    *_t10p95)        echo "--temperature 1.0 --top_p 0.95";;
+    *)               echo "";;
+esac; }
+
+worker(){   # $1 = gpu index
+    local g="$1" i it run tag ck csv claim
+    for ((i=g; i<${#ITEMS[@]}; i+=NG)); do
+        it="${ITEMS[$i]}"; run="${it%%:*}"; tag="${it##*:}"; ck="${tag%%_*}"
+        csv="$REPO/results/$run/$tag.csv"; claim="$csv.claim"
+        [ -s "$csv" ] && { say "[$it] 이미 있음, 건너뜀"; continue; }
+        # 원자적 claim -- 같은 CSV 에 두 프로세스가 append 하면 조용히 깨진다.
+        ( set -o noclobber; echo "$SLURM_JOB_ID gpu$g $(date)" > "$claim" ) 2>/dev/null \
+            || { say "[$it] 다른 워커가 잡았다, 건너뜀"; continue; }
+        say "[$it] GPU $g 생성 시작 (ckpt-$ck $(flags "$tag"))"
+        CUDA_VISIBLE_DEVICES="$g" SINGULARITYENV_CUDA_VISIBLE_DEVICES="$g" \
+        singularity exec --nv -B /vf,/data,/spin1 \
+            --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+            --env CUDA_VISIBLE_DEVICES="$g" \
+            "$SIF" bash -lc "source $REPO/.venv/bin/activate && cd $REPO && \
+              python scripts/generate_batched.py --ckpt '$CKPT' --cache_dir '$CACHE' \
+                --model_config_yaml '$YAML' --vis_dim 384 --split valid_newenc \
+                --adapter '$REPO/outputs/$run/checkpoint-$ck' \
+                --batch_size $BATCH $(flags "$tag") --out '$csv'" \
+            > "${LOG_DIR:-./logs}/vgen-${SLURM_JOB_ID}-${run//\//_}-${tag}.out" 2>&1
+        rc=$?
+        rows=$( [ -s "$csv" ] && "$REPO/.venv/bin/python" -c "import pandas,sys;print(len(pandas.read_csv(sys.argv[1])))" "$csv" 2>/dev/null || echo 0 )
+        say "[$it] rc=$rc rows=$rows"
+        [ "$rc" -eq 0 ] && [ "$rows" -eq 1552 ] || { say "[$it] 실패 -- CSV 격리"; mv -f "$csv" "$csv.bad" 2>/dev/null; }
+        rm -f "$claim"
+    done
+}
+for ((g=0; g<NG; g++)); do worker "$g" & sleep 20; done
+wait
+say "=============== vgen 완료 ==============="

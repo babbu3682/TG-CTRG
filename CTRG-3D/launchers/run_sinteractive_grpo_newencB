@@ -1,0 +1,73 @@
+#!/bin/bash
+# ==============================================================================
+# GRPO-on-newencB 전체 파이프라인을 **interactive 파티션**에서 한 job 으로 돌린다.
+#
+#   sbatch run_sinteractive_grpo_newencB      # 몇 번을 다시 제출해도 안전하다
+#
+# 왜 이 런처가 따로 있나
+# ----------------------
+# `gpu` 파티션은 kyungs2 의 FairShare 가 낮아 (Priority) 로 오래 대기한다. 반면
+# `interactive` 파티션은 실측으로 **제출 20초 만에** a100 을 준다 (2026-08-26 확인,
+# job 28411523). sinteractive 가 빠른 이유는 대화형이라서가 아니라 이 파티션을 쓰기
+# 때문이고, sbatch 로도 같은 파티션에 들어갈 수 있다 -- 사람이 터미널을 붙들고 있을
+# 필요가 없다는 뜻이다.
+#
+# 대가 두 가지:
+#   * walltime 최대 **1-12:00:00 (36h)**. 그래서 RL 이 한 번에 완주하지 못한다.
+#   * per-user **2 jobs**. VSCode 세션이 하나를 쓰므로 이 job 이 나머지 하나다
+#     (= 이 job 이 도는 동안에는 사용자가 sinteractive 를 새로 못 받는다).
+#
+# 그래서 **재제출 가능하도록** 짰다. 세 stage 를 각각 산출물 존재로 건너뛰므로,
+# 36h 에 잘리면 같은 커맨드를 다시 던지기만 하면 된다:
+#   * cache      train.npy / valid.npy 가 있으면 건너뜀
+#   * reference  reference.json 이 있으면 건너뜀
+#   * RL         run_sbatch_grpo_newencB 가 최신 checkpoint 에서 자동 resume
+#                (.rung 을 읽어 pd x accum 을 1차와 동일하게 유지한다 -- 바뀌면
+#                 스텝당 프롬프트 수가 달라져 이어받은 뒤부터 다른 실험이 된다)
+#
+# stage 를 `&&` 로 잇는 것이 아니라 각각 실패 시 즉시 죽인다 (set -e). 잘못된 캐시
+# 위에 참조를, 잘못된 참조 위에 RL 을 얹는 것이 이 파이프라인에서 가장 비싼 사고다.
+#
+# 로그는 ${LOG_DIR:-./logs} 에 쓴다 -- /tmp 는 계산 노드 로컬이라 job 이 끝나면 사라진다.
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --job-name ctrg-grpoB-int
+#SBATCH --partition interactive
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+#SBATCH --time 1-12:00:00
+
+set -euo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+CACHE="${REPO}/data/vision_cache/newencB_ep15_ckpt7455"
+REF="${REPO}/data/grpo_ref_newencB"
+cd "$REPO"
+
+echo "=============================================================="
+echo " GRPO on newenc B -- interactive 파티션 전체 파이프라인"
+echo "   $(date '+%F %T')   $(hostname)   job ${SLURM_JOB_ID:-?}"
+echo "   walltime 36h -- 잘리면 같은 커맨드를 다시 제출하면 이어진다"
+echo "=============================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+if [ -s "${CACHE}/train.npy" ] && [ -s "${CACHE}/valid.npy" ]; then
+    echo ">>> stage 1/3 cache: 이미 있음, 건너뜀 ($(du -sh "$CACHE" | cut -f1))"
+else
+    echo ">>> stage 1/3 cache: 생성"
+    bash run_sbatch_cache_newencB
+fi
+
+if [ -s "${REF}/reference.json" ]; then
+    echo ">>> stage 2/3 reference: 이미 있음, 건너뜀"
+else
+    echo ">>> stage 2/3 reference: 생성"
+    bash run_sbatch_grpo_ref_newencB
+fi
+
+echo ">>> stage 3/3 RL"
+bash run_sbatch_grpo_newencB
+
+echo "=============== all done  $(date '+%F %T') ==============="

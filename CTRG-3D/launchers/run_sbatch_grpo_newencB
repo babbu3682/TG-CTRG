@@ -1,0 +1,159 @@
+#!/bin/bash
+# ==============================================================================
+# GRPO 후학습 on newenc B (gtweight w=5) -- SFT best 위의 마지막 boosting.
+#
+#   sbatch run_sbatch_grpo_newencB          # 1차: smoke -> 학습 (walltime 까지)
+#   sbatch run_sbatch_grpo_newencB          # 2차 이후: 자동으로 이어서 돈다
+#
+# 같은 커맨드를 반복 제출하면 된다. OUTDIR 에 checkpoint-* 가 있으면 최신 것에서
+# --resume_from_checkpoint 로 이어받고, 없으면 처음부터 시작한다.
+#
+# 왜 이어받아야 하나: 1,500 스텝 x 실측 169.97 s = 70.8 h 로 3일 walltime 에 아슬아슬하다.
+# save_steps=100 이므로 walltime 에 잘려도 최대 100 스텝만 잃고, 같은 커맨드를 다시
+# 제출하면 이어진다.
+#
+# **마감 2026-08-30**: 이 런은 완주할 필요가 없다. 100 스텝마다 채점 가능한 체크포인트가
+# 나오므로, 마감 시점까지 채점된 것 중 최고를 쓰면 된다. 그래서 스텝을 많이 주는 것이
+# 위험이 아니라 공짜 옵션이다.
+#
+# 왜 1,500 스텝인가 (round 2 는 1,000): subset 을 8,000 -> 12,000 으로 늘려 **여전히
+# 정확히 1 epoch** 이다. round 2 는 1 epoch 완주 시점에도 오르는 중이었지만
+# (마지막 100 스텝 F1 +0.0080) entropy 0.687 -> 0.392, frac_reward_zero_std 가
+# 601 스텝 이후 0 을 벗어났다. 같은 프롬프트를 두 번째로 도는 것은 그룹 내 보상 분산을
+# 없앨 위험이 있고, 새 프롬프트는 그렇지 않다.
+#
+# pd x accum 은 **1차에서 고른 rung 을 $OUTDIR/.rung 에 적어 두고 재개 때 그대로 쓴다.**
+# generation_batch = pd x accum 이므로 rung 이 바뀌면 스텝당 프롬프트 수가 바뀌고
+# 이어받은 뒤부터 다른 실험이 된다.
+#
+# 중단 게이트 (docs/2026-08-22-grpo-review.md 8 과 동일):
+#   20 스텝  frac_reward_zero_std ~ 1.0        -> 학습 신호 없음, kill
+#   50 스텝  세 항 std 가 대략 1 : 1 : 1 아님   -> sigma 재측정 실패, kill
+#   200 스텝 full valid 채점에서 BLEU_mean < B 의 0.32947, 또는 CRG/F1 둘 다 B 미만 -> kill
+#   상시     entropy 가 0.2 아래로            -> 정책이 문체를 버리는 중
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --job-name ctrg-grpo-newencB
+#SBATCH --time 3-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+set -euo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+CKPT="${CKPT:-${REPO}/scripts/outputs/preserved/newencB_ep15_ckpt7455}"
+CACHE="${CACHE:-${REPO}/data/vision_cache/$(basename "${CKPT}")}"
+YAML="${REPO}/src/Model/ctrate_pillar0_chest_lapa.yaml"
+REF=${REPO}/data/grpo_ref_newencB
+OUTDIR="${OUTDIR:-${REPO}/outputs/grpo_newencB}"
+MAX_STEPS="${MAX_STEPS:-1500}"
+EXTRA="${EXTRA:-}"                 # ablation 파생 런처가 단일 요인을 여기에 넣는다
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+DRIVER=scripts/grpo_newencB.py
+
+for f in "${CACHE}/train.npy" "${CACHE}/train_index.json" "${CACHE}/train_meta.json" \
+         "${CKPT}/model.safetensors" "$YAML" \
+         "${REF}/subset12000.json" "${REF}/reference.json"; do
+    [ -s "$f" ] || { echo "missing: $f -- run run_sbatch_grpo_ref_newencB first" >&2; exit 1; }
+done
+for fl in --resume_from_checkpoint --output_dir --max_steps --smoke \
+          --per_device_train_batch_size --gradient_accumulation_steps; do
+    grep -q -- "add_argument(\"${fl}\"" "$REPO/$DRIVER" \
+        || { echo "flag not in $DRIVER: $fl" >&2; exit 1; }
+done
+
+# ---- 재개 지점 ---------------------------------------------------------------
+RESUME=""
+LAST=""
+if compgen -G "${OUTDIR}/checkpoint-*" > /dev/null; then
+    LAST=$(ls -d "${OUTDIR}"/checkpoint-* | sed 's#.*/##' | sort -t- -k2 -n | tail -1)
+    RESUME="${OUTDIR}/${LAST}"
+    [ -s "${RESUME}/trainer_state.json" ] || {
+        echo "가장 최신 체크포인트 ${RESUME} 에 trainer_state.json 이 없다 (쓰이는 중?)" >&2
+        exit 1; }
+    DONE=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['global_step'])" \
+              "${RESUME}/trainer_state.json")
+    if [ "$DONE" -ge "$MAX_STEPS" ]; then
+        echo "이미 ${DONE}/${MAX_STEPS} 스텝 -- 더 돌릴 것이 없다. MAX_STEPS 를 올려라." >&2
+        exit 0
+    fi
+    [ -s "${OUTDIR}/.rung" ] || { echo "재개인데 ${OUTDIR}/.rung 이 없다" >&2; exit 1; }
+    read -r PD ACC < "${OUTDIR}/.rung"
+fi
+
+echo "=============================================================="
+echo " GRPO on newenc B                $(date '+%F %T')"
+echo "   출발 정책   : ${CKPT}   (SFT best: CRG 0.4975 / macroF1 0.5187 / BLEU 0.32947)"
+echo "   캐시        : ${CACHE}"
+echo "   reference   : ${REF}/reference.json"
+echo "   output_dir  : ${OUTDIR}"
+echo "   max_steps   : ${MAX_STEPS}   (subset 12,000 / 8 프롬프트/스텝 = 1 epoch)"
+if [ -n "$RESUME" ]; then
+echo "   재개        : ${LAST} (global_step ${DONE}) -> 남은 $(( MAX_STEPS - DONE )) 스텝"
+echo "   rung        : pd ${PD} x accum ${ACC} (.rung 에서 읽음 -- 1차와 동일해야 한다)"
+else
+echo "   재개        : 없음 (처음부터)"
+fi
+echo "   단일 요인   : ${EXTRA:-(없음 -- 이것이 base)}"
+echo "   고정        : cap 768, lr 1e-5 warmup 20 constant, beta 0, alpha=gamma=lambda=1, seed 42"
+echo "=============================================================="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+export WANDB_PROJECT="PETRG-3D"
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE=offline
+    echo "WARNING: WANDB_API_KEY not set -- logging offline; 'wandb sync' later."
+fi
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+module load singularity
+run() {
+    singularity exec --nv -B /vf,/data,/spin1 \
+        --env WANDB_PROJECT="${WANDB_PROJECT}" \
+        --env WANDB_MODE="${WANDB_MODE:-online}" \
+        --env WANDB_API_KEY="${WANDB_API_KEY:-}" \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
+        "$SIF" bash -lc "source ${REPO}/.venv/bin/activate && cd ${REPO} && \
+            python ${DRIVER} --ckpt '${CKPT}' --cache_dir '${CACHE}' \
+                --model_config_yaml '${YAML}' $*"
+}
+
+# ---- 1차: smoke 사다리로 rung 을 정한다 -------------------------------------
+if [ -z "$RESUME" ]; then
+    SMOKE_LOG=$(mktemp)
+    PD=""; ACC=""
+    for rung in "16 4" "8 8"; do
+        set -- $rung
+        echo "=============== smoke: pd $1 x accum $2 = $(( $1 * $2 )) completions/step ==============="
+        # smoke 는 별도 디렉터리에 쓴다 -- OUTDIR 에 흔적을 남기면 재개 탐지가 오작동한다.
+        if run --smoke --per_device_train_batch_size "$1" --gradient_accumulation_steps "$2" \
+               --output_dir "${OUTDIR}_smoke" ${EXTRA} 2>&1 | tee "$SMOKE_LOG"; then
+            PD=$1; ACC=$2
+            echo "smoke 통과: pd $PD / accum $ACC"
+            break
+        fi
+        if grep -q "OutOfMemoryError\|CUDA out of memory" "$SMOKE_LOG"; then
+            echo "OOM -- 다음 rung 으로"; continue
+        fi
+        echo "smoke 가 OOM 이 아닌 이유로 죽었다. 사다리를 태우지 않고 멈춘다." >&2
+        tail -30 "$SMOKE_LOG" >&2
+        exit 1
+    done
+    rm -f "$SMOKE_LOG"
+    [ -n "$PD" ] || { echo "모든 rung 에서 OOM -- cap 또는 generation batch 를 줄여야 한다." >&2; exit 1; }
+    mkdir -p "$OUTDIR"
+    printf '%s %s\n' "$PD" "$ACC" > "${OUTDIR}/.rung"
+    echo "rung 기록: ${OUTDIR}/.rung = $PD $ACC"
+fi
+
+echo "=============== train: ${MAX_STEPS} steps @ pd $PD x accum $ACC ==============="
+run --per_device_train_batch_size "$PD" --gradient_accumulation_steps "$ACC" \
+    --max_steps "$MAX_STEPS" --output_dir "${OUTDIR}" \
+    ${RESUME:+--resume_from_checkpoint "${RESUME}"} ${EXTRA}
+
+echo "=============== done  $(date '+%F %T') ==============="

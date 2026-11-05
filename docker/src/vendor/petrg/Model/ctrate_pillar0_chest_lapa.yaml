@@ -1,0 +1,77 @@
+# ==============================================================================
+# Vision-encoder config for the lapa encoder.
+#
+# The checkpoint the new cls/ret templates were produced with:
+#   /data/drdcad/sunggu/0.Challenge/pillar-pretrain/logs/lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt
+# per that run's params.txt it continued pretraining FROM the open-source release
+# (`pretrained_safetensors: .../checkpoints/Pillar0-ChestCT/model.safetensors`,
+# `lapa: True`), and its finetune notes call it "the checkpoint that won abn
+# at 0.8730". pillar-finetune's CTRATE_FT_Atlas_retrieval_self_lapa and
+# CTRATE_ABN_cls_report_templates_lapa_f1max both read from it, so the
+# templates and this encoder belong together.
+#
+# Differences vs ctrate_pillar0_chest_opensource.yaml -- only three, and the
+# atlas body is untouched:
+#   * model_name -> MultimodalAtlasLAPA. Two bug fixes (see
+#     Model/pillar_mmatlas_lapa.py and Model/atlas_encoders_pillar0.py):
+#       - the patch-embed stride's anisotropic factor moves from W to D, so the
+#         attention-window grid stops being transposed relative to the feature map
+#       - one scale at native resolution instead of three nearest-upsampled and
+#         channel-concatenated (that interpolate also mixed up axis order)
+#   * pretrained -> the in-house .pt above rather than the HF-style release dir.
+#     MultimodalAtlas.setup_model handles both layouts.
+#   * scale_index -> 1. With the corrected stem a 256^3 volume at patch (8, 8, 4)
+#     gives a (D, H, W) = (64, 32, 32) feature map and native scales of
+#     65,536 / 1,024 / 16 tokens x 384 dim, so index 1 is 1,024 tokens.
+#
+# vis_dim becomes 384, NOT 1152: a single scale, not three concatenated. The
+# config that uses this yaml has to pass vis_dim=384 or the Perceiver's input
+# projection will not match.
+#
+# Cost note: 65,536 -> 1,024 encoder tokens is a 64x reduction on the
+# PerceiverResampler's cross-attention input. The LLM side is unchanged -- the
+# Perceiver still emits 128 latents, so max_seq stays what it was.
+#
+# atlas_args below are byte-identical to the lapa model config
+# (depth 8 / dim 384 / num_heads 6 / num_scales 3 / stages [2,2,8]), except
+# in_chans, kept at 11 as in the sibling yaml: AtlasStage ignores it (the 11
+# windowing channels are consumed by modalities.chest_ct.in_chans), and the
+# reference writes 1 there.
+# ==============================================================================
+vision_cfg:
+  model_name: MultimodalAtlasLAPA
+  scale_index: 1
+  # 1,024 = 16 x 8 x 8 on the corrected (D,H,W) grid. Asserted on the first
+  # forward: a wrong scale_index gives a valid shape and would train silently.
+  expect_tokens: 1024
+  model_config:
+    pretrained: "/data/drdcad/sunggu/0.Challenge/pillar-pretrain/logs/lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt"
+    modalities:
+      chest_ct:
+        image_size: [256, 256, 256]
+        in_chans: 11
+        local2global: [4, 4, 4]
+        merge_ratio: [4, 4, 4]
+        num_features: 192
+        patch_size: [8, 8, 4]
+    model:
+      atlas_args:
+        attn_drop: 0.0
+        class_token: false
+        depth: 8
+        dim: 384
+        drop: 0.0
+        drop_path_rate: 0.3
+        embed_dim: 384
+        global_pool: "avg"
+        in_chans: 11
+        in_dim: 64
+        mlp_ratio: 4.0
+        num_classes: 0
+        num_features: 192
+        num_heads: 6
+        num_scales: 3
+        pre_norm: false
+        qk_scale: false
+        qkv_bias: true
+      stages: [2, 2, 8]

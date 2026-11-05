@@ -1,0 +1,172 @@
+#!/bin/bash
+
+# Retrieval task launcher (the single canonical entry point for this task —
+# see run_sbatch_abn for the abn classification counterpart).
+#
+# Usage: sbatch run_sbatch_ret [config_file] [exp_name] [notes]
+#   (forwarded to scripts/run_ctrate_retrieval.sh — see that file for details)
+#
+# 인자 없이 `sbatch run_sbatch_ret`만 치면 아래 DEFAULT_* (phrase_align_split 비교 런)로
+# 실행된다. 큐가 밀릴 때 다른 계정에서 그대로 제출할 수 있도록 기본값을 박아둔 것.
+#
+# ⚠️ 다른 유저 아이디로 제출하기 전에 확인할 것 (제출 계정이 kyungs2가 아니면 필요):
+#   1) ~/logs 디렉토리가 있어야 한다  ->  mkdir -p ~/logs
+#      (--output이 /home/%u/logs/ 로 바뀌어 제출한 계정의 홈으로 간다)
+#   2) 이 저장소의 logs/CTRATE/ 에 쓰기 권한이 있어야 체크포인트가 저장된다.
+#      현재 drwxr-s--- kyungs2 drdcad 라 그룹에 쓰기 비트가 없다. 소유자(kyungs2)가
+#         chmod -R g+w logs/CTRATE && chmod g+w logs
+#      를 해주거나, 제출 시 --opts main.checkpoints_dir <쓰기가능경로> 로 우회할 것.
+#      스크립트가 시작 시 직접 검사해서 안 되면 즉시 중단한다(아래 preflight).
+#   3) 데이터/체크포인트는 drdcad 그룹 읽기 권한이면 충분하다(확인함).
+# When running a comparison variant (e.g. different text embedding pooling),
+# pass a distinct exp_name AND override --job-name so it's distinguishable both
+# in squeue/sacct and in its checkpoints directory (logs/CTRATE/<exp_name>/):
+#   sbatch --job-name=finetune_ret_lasthidden run_sbatch_ret \
+#       configs/ctrate_retrieval_finetune_lz4_pillar_opensource.yaml \
+#       CTRATE_FT_Atlas_retrieval_pillar_freeze_lasthidden
+#
+# sacct -r gpu -S 2026-06-01 --format=JobID,JobName%20,Partition,State,Start,End,ExitCode,NodeList | grep finetune_ret
+# 예상 시작 체크: squeue --start -u $USER -o "%.18i %.9P %.30j %.2t %20S %.6D %20R"
+# GPU 체크  : srun --overlap nvidia-smi --jobid=<JOBID>
+
+# SBatch Logging and mailing
+# %u = 제출한 계정 이름. 계정마다 자기 홈의 ~/logs로 간다(없으면 미리 mkdir).
+#SBATCH --output /home/%u/logs/%x-%A.out
+# mail-user는 일부러 비워둠 — 지정하지 않으면 SLURM이 제출한 계정으로 보낸다.
+# 특정 주소로 받고 싶으면 제출 시 sbatch --mail-user=... 로 주면 된다.
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+########## SBatch Reservation and runtime : gpu (a100) 스펙: Cores 32, CPUs 64, GPUs 4, Mem 243g
+
+#SBATCH --job-name finetune_ret_phrase_align_split
+# 5일 — 기준선(job 26978948, 오픈소스 인코더)과 **동일하게** 유지한다. 이 런은 activ
+# 토큰이 절반(32,768 vs 65,536)이라 더 짧게 잡아도 되지만, walltime이 다르면 한쪽만
+# 잘렸을 때 본 epoch 수가 달라져 "인코더만 바꾼 비교"가 성립하지 않는다. 기준선이
+# 50 epoch을 3d04h에 끝냈으므로 5일이면 양쪽 다 여유가 있다.
+# (짧은 walltime이 backfill에 유리한 건 맞지만, 비교 런에서는 조건 일치가 우선.)
+#SBATCH --time 5-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+# (EXTRA)
+##SBATCH --dependency afterany:<JOB-ID>
+##SBATCH --qos cpu
+
+AVAILABLE_CPUS=$(nproc)
+echo "자동으로 계산된 CPU 개수: $AVAILABLE_CPUS"
+
+# ⚠️ WANDB_API_KEY는 저장소에 두지 않는다 — origin이 공용 저장소(YalaLab/pillar-finetune)라
+# 커밋하면 그대로 공개된다. /data/drdcad/sunggu/.wandb_key 에 export WANDB_API_KEY="..." 를
+# 한 줄로 두고(chmod 600) 여기서 읽는다. 없으면 조용히 넘어가지 않고 즉시 죽는다.
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-/data/drdcad/sunggu/.wandb_key}"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -r "$WANDB_KEY_FILE" ]; then . "$WANDB_KEY_FILE"; fi
+: "${WANDB_API_KEY:?WANDB_API_KEY 없음 — $WANDB_KEY_FILE 을 만들거나 환경변수로 주세요}"
+export WANDB_API_KEY
+
+module load singularity
+
+# printf %q-escape each positional arg individually before interpolating into
+# the "bash -lc '<string>'" wrapper below — naive '$1' '$2' '$3' quoting
+# breaks (silent syntax-error exit) if any arg (e.g. notes text) contains an
+# apostrophe, as happened with job 26976251's notes string.
+# 인자를 안 주면 phrase_align_split 비교 런으로 기본 실행 (위 Usage 참고).
+DEFAULT_CONFIG="configs/ctrate_retrieval_finetune_lz4_pillar_self_phrase_align_split.yaml"
+DEFAULT_EXP="CTRATE_FT_Atlas_retrieval_self_phrase_align_split"
+DEFAULT_NOTES="Retrieval with PhraseAlign-Split self-pretrained encoder (phrase_align_split_pillar0_lz4_v1/epoch_10, frozen, eval-pinned): activ -> Simple_TranSQ, last-token text cache + last-token gallery. Encoder-only swap vs opensource Pillar0-ChestCT baseline (job 26978948: val_loss 0.6222 @ ep48, match_recall@1 0.2173)."
+
+CONFIG="${1:-$DEFAULT_CONFIG}"
+EXP_NAME="${2:-$DEFAULT_EXP}"
+NOTES="${3:-$DEFAULT_NOTES}"
+echo "config=$CONFIG"
+echo "exp_name=$EXP_NAME"
+
+# --- preflight: 다른 계정에서 돌릴 때 조용히 실패하는 두 지점을 미리 잡는다 ---
+REPO=/data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune
+if [ ! -r "$REPO/$CONFIG" ]; then
+    echo "ERROR: config를 읽을 수 없습니다: $REPO/$CONFIG (권한 또는 경로 확인)" >&2
+    exit 1
+fi
+if [ ! -w "$REPO/logs/CTRATE" ]; then
+    echo "ERROR: $REPO/logs/CTRATE 에 쓰기 권한이 없습니다 (계정: $(whoami))." >&2
+    echo "       소유자가 'chmod g+w logs logs/CTRATE' 를 해주거나," >&2
+    echo "       제출 시 main.checkpoints_dir 을 쓰기 가능한 경로로 override 하세요." >&2
+    exit 1
+fi
+
+QUOTED_ARGS=$(printf '%q ' "$CONFIG" "$EXP_NAME" "$NOTES")
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "bash /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune/scripts/run_ctrate_retrieval.sh $QUOTED_ARGS"
+
+
+########## 제출 기록 (최신이 위)
+
+# label_adjust epoch_10 + 2026-08-21 ablation 확정 setting (clip_preln) — job 28122465
+#   체크포인트: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/logs/label_adjust/checkpoints/epoch_10.pt
+#   (pretrain 런 label_adjust = phrase_align_polar loss + 4 판독자 병합 라벨 v5, job 28056570 제출 시점
+#    RUNNING, val_loss 최저 4.8183 @ ep10)
+#   config: configs/ctrate_retrieval_finetune_lz4_pillar_self_label_adjust_clip_preln.yaml
+#   = ..._self_lapa_clip_preln.yaml 에서 **pretrained + exp_name + notes 3개 키만** 바꾼 것.
+#   두 config를 flatten해서 비교해 diff가 정확히 그 3개임을 확인했다.
+#   즉 ablation 확정 4개 변경(decoder pre-LN / clip_grad 1.0 / step-granular warmup 0.1 epoch /
+#   patience 5 + min_delta 0.001)은 그대로, 인코더만 교체.
+#   ⚠️ 아키텍처는 lapa와 동일(phrase_align_polar는 loss·label만 바꿈, main.py:1006이
+#   model_kwargs["lapa"]=True 강제). state_dict 키 752/752 동일, shape 불일치 0.
+#   ⚠️ **비교 confound (2026-08-23 정정)**: 기존 lapa의 CRG 0.5229 / pp 0.5322는
+#   **base config**(post-LN, clip 0.1, warmup 4ep, patience 8)로 나온 값이다. 처음 "분리되지
+#   않는다"고 적었는데 과한 서술이었다 — 네 knob 중 clip_grad(job 27999975 arm clip1.0,
+#   ΔR@1 +0.0120)와 pre-LN(같은 job, ΔR@1 +0.0002 = null)은 old 인코더에서 실제로 쟀고,
+#   warmup 단축과 patience 5/min_delta는 어느 arm도 재지 않았다(baseline이 이미 warmup config,
+#   patience는 0으로 껐음). 측정된 둘도 3 epoch · R@1/report_f1 기준이고 ckpt_freq 999로 예측을
+#   안 남겨 paired 검정이 안 되므로 full-run CRG 스케일 효과 크기는 없다. 완전 분리에는
+#   lapa + clip_preln full run이 필요하고 미실행이다(job 28056181 제출 후 취소).
+#   --time은 기준선(job 27890344, 5일 / 실제 21h20m)과 동일하게 5일 유지.
+#   standalone 검증(A100, 컨테이너): strict load 747/747 + 값 전수 일치(0 mismatch),
+#   activ (2,384,16,8,8)=1,024 토큰, retrieval sent_feats (2,64,4096) / topic_preds (2,64),
+#   TranSQLoss train 1.3930 / eval 1.3941 (양쪽 유한, sim 1.0021 / cls 0.0614 / contrastive 3.2959),
+#   build_optimizer(layer_decay 0.9) 2 groups / 121 tensors / 100,028,417 params = requires_grad 합 일치,
+#   scheduler `interval: step` 경로가 CosineAnnealingWarmup.adjust_learning_rate로 정상 해석됨.
+#   채점은 report generation으로: threshold 0.4 + `--display-overrides data/display_overrides.json`.
+# sbatch --job-name=finetune_ret_label_adjust_clip_preln --time=5-00:00:00 run_sbatch_ret \
+#     configs/ctrate_retrieval_finetune_lz4_pillar_self_label_adjust_clip_preln.yaml \
+#     CTRATE_FT_Atlas_retrieval_self_label_adjust_clip_preln \
+#     "ret best setting fixed by the 2026-08-21 ablation ... CONFOUND WARNING ..."
+
+
+# lapa 인코더 (abn 전체 1등 체크포인트) + 단일 스케일 activ — job 27890344
+#   (첫 제출 27887049는 epoch 0만 돌고 취소 — RetrievalMetric이 CPU에서 27분/epoch을 먹으며
+#    GPU를 47% 유휴로 두는 것을 발견해 GPU로 옮긴 뒤 재제출. CLAUDE.md "GPU 낭비 제거" 절 참고.)
+#   체크포인트: lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt (abn maxpool 런에서
+#   val macro AUROC 0.8730 = 통합 순위 1등, job 27744448). abn과 **같은 체크포인트/같은
+#   백본 클래스**(MultimodalAtlasSelfLAPA: stride 교정 stem + scale_index=1).
+#   activ가 (B,384,16,8,8)=1,024 토큰이라 head input_dim만 1152->384로 강제 변경되고,
+#   나머지(d_model 1152, d_target 4096, num_queries 64, 6 layers, post-LN, aux_loss False,
+#   batch 10, lr 1e-4, wd 0.01, layer_decay 0.9, 50 epoch, patience 8, clip_grad 0.1,
+#   augmentation, text_cache, lasthidden gallery)는 기준선과 전부 동일.
+#   decoder memory가 32배 짧아(1,024 vs 32,768) epoch당 시간이 크게 줄어들 전망.
+#   ⚠️ val_loss를 기존 두 런과 비교하지 말 것 — retrieval_loss.py가 08-16 22:42에 수정돼
+#   (DB re-balance 복원, NTR bias 순서, sim_reduction pair, avg_pos 15.3) 목적함수가 다르다.
+#   이 런이 **수정된 loss로 도는 최초의 retrieval 런**이다. 비교는 recall@k / report_f1로.
+#   --time은 기준선과 동일하게 헤더 기본값 5일 유지(통제 비교에서 walltime도 맞춘다).
+#   standalone 검증: strict load 747/747 + 값 전수 일치, activ (2,384,16,8,8)=1024 토큰,
+#   Simple_TranSQ 출력 sent_feats (2,64,4096)/topic_preds (2,64), pos_embed 캐시 키 (8,8,16)
+#   = 비정사각 grid 정상 처리, TranSQLoss train/eval 양쪽 유한값(1.4348/1.4356),
+#   optimizer(layer_decay) 121 tensors / 100,028,417 params = requires_grad 합과 일치.
+# sbatch --job-name=finetune_ret_lapa run_sbatch_ret \
+#     configs/ctrate_retrieval_finetune_lz4_pillar_self_lapa.yaml \
+#     CTRATE_FT_Atlas_retrieval_self_lapa \
+#     "Retrieval with the lapa encoder ... compare recall@k and report_f1."
+
+# phrase_align_split 인코더 비교 런 — job 27309852, COMPLETED (1d21h)
+#   결과: best val_loss 0.6248 @ ep29, ep37 early stop(patience 8),
+#   test match_recall@1 0.1937 / match_recall@10 0.3658 / sample_recall@10 0.0905 /
+#   report_f1 0.1382 — 오픈소스 기준선(0.2173 / 0.1545)보다 **낮음**.
+#   즉 abn에서는 self-pretrained 인코더가 유리했지만 retrieval에서는 phrase_align_split이
+#   오픈소스를 못 넘었다(구 loss 기준). 이 런은 DEFAULT_*로 이 파일에 박혀 있다.

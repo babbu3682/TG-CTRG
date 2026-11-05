@@ -1,0 +1,163 @@
+#!/bin/bash
+# ==============================================================================
+# GRPO 갈래 유지(keepalive) -- interactive job 하나에 GPU N 장, 갈래 N 개.
+#
+#   BRANCHES_ONLY="a2" sbatch --gres=gpu:a100:1 --cpus-per-task=16 --mem 60g \
+#       run_sinteractive_grpoB_keepalive
+#
+# 왜 새 런처인가 (run_sinteractive_grpoB_3way 를 안 고치는 이유)
+# --------------------------------------------------------------
+#   그 파일의 BRANCHES 는 base/g3/g6/a2nb 로 **코드에 박혀** 있는데, 지금 살려야 하는
+#   것은 a2from700 / grpo_newencB / a2lam05from900 이다. 그 배열을 고치면 인용된
+#   수치(문서 곳곳)의 재현 경로가 흔들린다. 그래서 갈래 목록을 **데이터로** 빼고
+#   (scripts/keepalive_branches.conf) 실행부만 같은 형태로 다시 만들었다.
+#   run_branch() 의 singularity 커맨드는 3way 와 **의도적으로 동일**하다 -- 여기서
+#   갈라지면 이어받은 뒤부터 다른 실험이 된다.
+#
+# 로그를 /home 에 두지 않는 이유
+#   /home 쿼터 16GB 중 13.9GB(87%)가 이미 차 있다. 2026-08-29 에 TRL 의
+#   log_completions 가 /home 을 채워 갈래 하나가 `Disk quota exceeded` 로 죽고
+#   A100 한 장이 2.5시간 놀았다. job stdout 도 갈래 로그도 전부 /data 로 보낸다.
+#
+# save_steps=100 이라 walltime 에 잘려도 최대 100 스텝만 잃고, 같은 커맨드를 다시
+# 내면 각 갈래가 자기 OUTDIR 의 최신 체크포인트에서 이어받는다.
+#SBATCH --output /data/drdcad/sunggu/logs/%x-%A.out
+#SBATCH --job-name ctrg-keepalive
+#SBATCH --partition interactive
+#SBATCH --time 1-00:00:00
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+set -uo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+VENV=$REPO/.venv
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+DRIVER=$REPO/scripts/grpo_newencB.py
+CKPT=$REPO/scripts/outputs/preserved/newencB_ep15_ckpt7455
+CACHE=$REPO/data/vision_cache/newencB_ep15_ckpt7455
+YAML=$REPO/src/Model/ctrate_pillar0_chest_lapa.yaml
+CONF=${KEEPALIVE_CONF:-$REPO/scripts/keepalive_branches.conf}
+MAX_STEPS=${MAX_STEPS:-1500}
+STAGGER=${STAGGER:-180}   # fp32 Qwen3-8B 를 CPU 로 올리는 피크(~32GB)가 겹치면 노드 RAM 이 터진다
+LOGDIR=${BRANCH_LOGDIR:-/data/drdcad/sunggu/logs}
+
+[ -s "$CONF" ] || { echo "conf 없음: $CONF" >&2; exit 1; }
+
+# name|outdir|extra 를 conf 에서 읽는다 (순서 = 우선순위 = GPU 인덱스 순서)
+BRANCHES=()
+while IFS= read -r _l; do
+    case "$_l" in ''|'#'*) continue;; esac
+    BRANCHES+=("$_l")
+done < "$CONF"
+
+BRANCHES_ONLY="${BRANCHES_ONLY:-}"
+if [ -n "$BRANCHES_ONLY" ]; then
+    _sel=()
+    for _b in "${BRANCHES[@]}"; do
+        for _w in $BRANCHES_ONLY; do [ "${_b%%|*}" = "$_w" ] && _sel+=("$_b"); done
+    done
+    BRANCHES=("${_sel[@]}")
+fi
+[ "${#BRANCHES[@]}" -ge 1 ] || { echo "고른 갈래가 없다: BRANCHES_ONLY='$BRANCHES_ONLY'" >&2; exit 1; }
+
+# KEEPALIVE_DRYRUN=1 이면 GPU 없이(로그인 노드에서) 사전검사와 커맨드 조립까지만 한다.
+# 이 경로는 "새벽에 만들어 낮에 처음 돌아가는" 코드라, 실제 제출 전에 한 번은
+# 밟아 봐야 한다. 실행만 건너뛰고 나머지는 본 경로와 같은 코드를 지난다.
+DRYRUN=${KEEPALIVE_DRYRUN:-0}
+
+# 갈래 수 > 보이는 GPU 수면 두 갈래가 같은 카드에 올라가 둘 다 OOM 난다. 크게 실패한다.
+NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || echo 0)
+[ "$DRYRUN" = 1 ] && NGPU=${#BRANCHES[@]}
+if [ "$NGPU" -lt "${#BRANCHES[@]}" ]; then
+    echo "GPU $NGPU 장인데 갈래 ${#BRANCHES[@]} 개다 -- --gres 와 BRANCHES_ONLY 가 어긋났다" >&2
+    exit 1
+fi
+echo ">>> 갈래: $(for x in "${BRANCHES[@]}"; do printf '%s ' "${x%%|*}"; done) (GPU $NGPU 장)"
+
+fail=0; say() { [ "$1" = OK ] && printf "  OK   %s\n" "$2" || { printf "  NO   %s\n" "$2"; fail=1; }; }
+for f in "$DRIVER" "$CKPT/model.safetensors" "$CACHE/train_meta.json" "$YAML" \
+         "$VENV/bin/activate" "$SIF" \
+         "$REPO/data/grpo_ref_newencB/subset12000.json" \
+         "$REPO/data/grpo_ref_newencB/reference.json"; do
+    # 존재가 아니라 **실제로 열어서** 확인한다. 다른 계정(mathaits)이 쓴 파일은 0600 으로
+    # 떨어질 수 있고, safetensors 는 그 권한 거부를 FileNotFoundError 로 보고한다.
+    { [ -s "$f" ] && head -c 8 "$f" >/dev/null 2>&1; } && say OK "${f#$REPO/}" || say NO "읽을 수 없음: $f"
+done
+for fl in --alpha --gamma --lambda_bleu --resume_from_checkpoint --output_dir --prompts_only; do
+    grep -q -- "add_argument(\"${fl}\"" "$DRIVER" && say OK "flag $fl" || say NO "flag 없음: $fl"
+done
+FREE=$(df -Pk "$LOGDIR" | awk 'NR==2{print int($4/1048576)}')
+[ "${FREE:-0}" -ge 5 ] && say OK "로그 대상 여유 ${FREE}G ($LOGDIR)" || say NO "로그 대상 여유 부족: ${FREE}G ($LOGDIR)"
+
+for b in "${BRANCHES[@]}"; do
+    nm="${b%%|*}"; rest="${b#*|}"; d="${rest%|*}"
+    mkdir -p "$d/completions" 2>/dev/null
+    { touch "$d/.w" 2>/dev/null && rm -f "$d/.w"; } && say OK "쓰기 $nm" || say NO "쓸 수 없음: $d"
+    # TRL 의 log_completions 가 쓰는 하위 디렉터리. 다른 계정이 먼저 만들면 0750 이라
+    # kyungs2 가 못 쓰고 **첫 스텝이 끝난 뒤에야** PermissionError 로 죽는다.
+    { touch "$d/completions/.w" 2>/dev/null && rm -f "$d/completions/.w"; } \
+        && say OK "쓰기 $nm/completions" \
+        || say NO "쓸 수 없음: $d/completions (소유자 $(stat -c %U "$d/completions" 2>/dev/null))"
+    [ -s "$d/.rung" ] || { say NO ".rung 없음: $d"; continue; }
+    read -r _pd _ac < "$d/.rung"
+    # rung 이 바뀌면 스텝당 프롬프트 수가 달라져 이어받은 뒤부터 다른 실험이 된다.
+    [ "$(( _pd * _ac ))" = 64 ] && say OK "rung $nm = $_pd x $_ac (8 프롬프트/스텝)" \
+        || say NO "rung $nm = $_pd x $_ac -> generation batch $(( _pd * _ac )), 64 여야 한다"
+    ls -d "$d"/checkpoint-* >/dev/null 2>&1 && say OK "재개 지점 있음 $nm" || say NO "체크포인트 없음: $d"
+done
+[ "$fail" -eq 0 ] || { echo "사전검사 실패 -- 아무것도 시작하지 않았다" >&2; exit 1; }
+
+echo "=============================================================="
+echo " GRPO keepalive  $(date '+%F %T')  host=$(hostname)  job=${SLURM_JOB_ID:-?}"
+[ "$DRYRUN" = 1 ] && echo " *** DRYRUN -- 실행하지 않는다 ***" \
+                  || nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+echo "=============================================================="
+[ "$DRYRUN" = 1 ] || module load singularity
+
+run_branch() {   # $1 gpu  $2 name  $3 outdir  $4 extra
+    local g="$1" nm="$2" d="$3" ex="$4" resume="" latest
+    # 절대경로에는 'PETRG-3D' 의 하이픈이 들어 있어 `sort -t- -k2` 가 숫자가 아닌
+    # 필드를 잡는다 -> 전 항목이 동률이 되어 사전순 fallback 으로 checkpoint-900 이
+    # checkpoint-1100 을 이긴다(2026-08-30 실측, 하마터면 a2:1000 을 덮어쓸 뻔했다).
+    # 반드시 basename 의 숫자만 정렬한다.
+    latest=$(ls -1d "$d"/checkpoint-* 2>/dev/null | sed 's#.*/checkpoint-##' | sort -n | tail -1)
+    [ -n "$latest" ] && latest="$d/checkpoint-$latest"
+    [ -n "$latest" ] && resume="--resume_from_checkpoint '$latest'"
+    read -r pd ac < "$d/.rung"
+    echo ">>> [$nm] GPU $g  outdir=$(basename "$d")  재개=$(basename "${latest:-없음}")  extra='${ex:-없음}'"
+    if [ "$DRYRUN" = 1 ]; then
+        echo "    would run: python $(basename "$DRIVER") --per_device_train_batch_size $pd" \
+             "--gradient_accumulation_steps $ac --max_steps $MAX_STEPS --output_dir '$d'" \
+             "--prompts_only $ex $resume"
+        return 0
+    fi
+    CUDA_VISIBLE_DEVICES="$g" SINGULARITYENV_CUDA_VISIBLE_DEVICES="$g" \
+    singularity exec --nv -B /vf,/data,/spin1 \
+        --env WANDB_MODE=offline --env WANDB_DIR=/tmp/wandb_$nm \
+        --env PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+        "$SIF" bash -lc "source $VENV/bin/activate && cd $REPO && \
+            python $DRIVER --ckpt '$CKPT' --cache_dir '$CACHE' --model_config_yaml '$YAML' \
+                --per_device_train_batch_size $pd --gradient_accumulation_steps $ac \
+                --max_steps $MAX_STEPS --output_dir '$d' --prompts_only $ex $resume"
+}
+
+# 갈래를 **인라인으로** 띄운다. P=$(run_branch ...) 로 부르면 백그라운드 프로세스가
+# 명령치환 서브셸의 자식이 되어 아래 wait 가 "not a child of this shell" 로 즉시 실패한다
+# -- 갈래가 아직 도는데 job 이 성공한 것처럼 끝난다.
+PIDS=(); NAMES=()
+for _i in "${!BRANCHES[@]}"; do
+    set -- "${BRANCHES[$_i]}"; nm="${1%%|*}"; rest="${1#*|}"; dir="${rest%|*}"; ex="${rest#*|}"
+    run_branch "$_i" "$nm" "$dir" "$ex" > "$LOGDIR/ka-$nm-${SLURM_JOB_ID:-x}.out" 2>&1 &
+    PIDS+=($!); NAMES+=("$nm")
+    [ "$_i" -lt "$(( ${#BRANCHES[@]} - 1 ))" ] && sleep "$STAGGER"
+done
+
+echo "pids: ${PIDS[*]}   갈래: ${NAMES[*]}   로그: $LOGDIR/ka-<갈래>-${SLURM_JOB_ID:-x}.out"
+rc=0
+for _i in "${!PIDS[@]}"; do
+    if wait "${PIDS[$_i]}"; then echo "  done: ${NAMES[$_i]}"
+    else echo "  FAILED: ${NAMES[$_i]}"; rc=1; fi
+done
+echo "=============== 종료  갈래=${NAMES[*]}  rc=$rc  $(date '+%F %T') ==============="
+exit $rc

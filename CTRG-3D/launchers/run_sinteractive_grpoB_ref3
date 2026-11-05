@@ -1,0 +1,158 @@
+#!/bin/bash
+# ==============================================================================
+# newencB reference 생성을 **GPU 3장에 샤딩**해서 돌린다.  (critical path)
+#
+#   sbatch run_sinteractive_grpoB_ref3      # 몇 번을 다시 제출해도 안전하다
+#
+# 왜 샤딩인가
+# -----------
+# 앞선 Phase A(28417773)는 GPU 3장을 잡아 놓고 **reference 를 GPU 한 장으로만** 돌렸다
+# (나머지 둘은 ablation 채점). reference 는 RL 을 막고 있는 유일한 단계인데 ETA 가
+# 14.5 h 였다. 12,000 볼륨을 3등분하면 장당 4,000 이고, 실측 3.2 s/vol 기준 **~3.6 h** 다.
+#
+# `build_grpo_reference_crgf1bleu.py` 는 CSV 를 `{SampleName: row}` 로 읽으므로
+# (`--pred_csv` -> `by_name`) **행 순서가 무관**하다. 그래서 샤드 CSV 3개를 그냥 이어
+# 붙이면 단일 생성과 동일한 입력이 된다.
+#
+# batch 는 **32** 다. 64 로 올려 봤으나 오히려 40% 느렸다 -- 배치가 프롬프트 길이
+# 내림차순으로 정렬돼 있어도 **생성 길이는 그것과 무관**하고, HF `generate` 는 배치 안
+# 가장 긴 생성이 끝나야 배치가 끝난다(순간 s/vol 2.45~8.30 으로 요동). 64개 중 최장이
+# 32개 중 최장보다 길어서 배치를 키운 만큼 손해다. 상세: docs/...-grpo-on-newencB.md §13.1
+#
+# 재개 안전성: 샤드별 CSV 가 이미 있고 행 수가 맞으면 그 샤드를 건너뛴다.
+# `generate_batched.py` 는 마지막에 한 번에 쓰므로, 존재하는 CSV 는 완성본이다.
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --job-name ctrg-grpoB-ref3
+#SBATCH --partition interactive
+#SBATCH --gres=gpu:a100:3
+#SBATCH --cpus-per-task=48
+#SBATCH --mem 180g
+#SBATCH --time 8:00:00
+
+REPO=/data/drdcad/sunggu/0.Challenge/PETRG-3D
+LOGD=${LOG_DIR:-./logs}
+JID=${SLURM_JOB_ID:-manual}
+NSHARD=3
+BATCH=${REF_BATCH:-32}
+STAGGER=${STAGGER:-150}
+
+CKPT="${REPO}/scripts/outputs/preserved/newencB_ep15_ckpt7455"
+CACHE="${REPO}/data/vision_cache/newencB_ep15_ckpt7455"
+YAML="${REPO}/src/Model/ctrate_pillar0_chest_lapa.yaml"
+REF="${REPO}/data/grpo_ref_newencB"
+SIF=/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif
+cd "$REPO" || exit 1
+
+echo "=============================================================="
+echo " newencB reference -- GPU ${NSHARD}장 샤딩   $(date '+%F %T')"
+echo "   $(hostname)   job ${JID}   batch ${BATCH}"
+echo "=============================================================="
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+
+[ "$(nvidia-smi -L | wc -l)" -ge "$NSHARD" ] || { echo "ERROR: GPU ${NSHARD}장이 필요하다" >&2; exit 1; }
+for f in "${CACHE}/train.npy" "${CACHE}/train_meta.json" "${CKPT}/model.safetensors" \
+         "$YAML" "${REF}/subset12000.json"; do
+    [ -s "$f" ] || { echo "ERROR missing: $f" >&2; exit 1; }
+done
+
+if [ -s "${REF}/reference.json" ]; then
+    echo ">>> reference.json 이미 있음. 할 일 없음."; exit 0
+fi
+
+module load singularity
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+# ---- subset 12,000 을 결정적으로 3등분 --------------------------------------
+# 정렬한 뒤 i % NSHARD 로 나눈다. 이름 순 정렬이라 재실행해도 같은 분할이 나오고,
+# 라운드로빈이라 각 샤드의 프롬프트 길이 분포가 비슷해져 세 GPU 가 같이 끝난다.
+singularity exec -B /vf,/data,/spin1 "$SIF" bash -lc \
+  "source ${REPO}/.venv/bin/activate && python - <<'PY'
+import json
+from pathlib import Path
+ref = Path('${REF}')
+names = sorted(json.loads((ref/'subset12000.json').read_text()))
+n = ${NSHARD}
+for i in range(n):
+    part = names[i::n]
+    (ref/f'shard{i}.json').write_text(json.dumps(part))
+    print(f'  shard{i}: {len(part)} names')
+assert sum(len(names[i::n]) for i in range(n)) == len(names) == 12000
+print(f'  total {len(names)}')
+PY" || { echo "ERROR: 샤드 분할 실패" >&2; exit 1; }
+
+run_shard() {                    # run_shard <gpu>
+    local g="$1"
+    local out="${REF}/ref_shard${g}.csv"
+    local lf="$LOGD/ctrg-grpoB-ref3-${JID}-shard${g}.out"
+    local want; want=$(singularity exec -B /vf,/data,/spin1 "$SIF" bash -lc \
+        "source ${REPO}/.venv/bin/activate && python -c \"import json;print(len(json.load(open('${REF}/shard${g}.json'))))\"")
+    if [ -s "$out" ]; then
+        local have; have=$(( $(wc -l < "$out") - 1 ))
+        if [ "$have" -ge "$want" ]; then
+            echo "    shard${g}: 이미 완료 (${have} rows), 건너뜀"; return 0
+        fi
+        echo "    shard${g}: CSV 가 불완전(${have}/${want}) -- 다시 생성"
+    fi
+    CUDA_VISIBLE_DEVICES="$g" SINGULARITYENV_CUDA_VISIBLE_DEVICES="$g" \
+    singularity exec --nv -B /vf,/data,/spin1 \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
+        "$SIF" bash -lc "source ${REPO}/.venv/bin/activate && cd ${REPO} && \
+        python scripts/generate_batched.py \
+            --ckpt '${CKPT}' --cache_dir '${CACHE}' \
+            --model_config_yaml '${YAML}' --vis_dim 384 \
+            --split train_newenc --names_json '${REF}/shard${g}.json' \
+            --batch_size ${BATCH} --out '${out}'" > "$lf" 2>&1
+}
+
+echo ">>> 샤드 3개 병렬 생성 (batch ${BATCH}, stagger ${STAGGER}s)"
+run_shard 0 & P0=$!
+sleep "$STAGGER"
+run_shard 1 & P1=$!
+sleep "$STAGGER"
+run_shard 2 & P2=$!
+echo "    pids: $P0 $P1 $P2"
+echo "    진행:  tail -f $LOGD/ctrg-grpoB-ref3-${JID}-shard0.out"
+
+wait "$P0"; R0=$?
+wait "$P1"; R1=$?
+wait "$P2"; R2=$?
+echo ">>> shard exit codes: $R0 $R1 $R2"
+for r in $R0 $R1 $R2; do [ "$r" -ne 0 ] && { echo "ERROR: 실패한 샤드가 있다" >&2; exit 1; }; done
+
+# ---- 이어 붙이고, 12,000 을 정확히 덮는지 검사 ------------------------------
+echo ">>> 샤드 CSV 결합 + 커버리지 검사"
+singularity exec -B /vf,/data,/spin1 "$SIF" bash -lc \
+  "source ${REPO}/.venv/bin/activate && python - <<'PY'
+import json, pandas as pd
+from pathlib import Path
+ref = Path('${REF}')
+parts = [pd.read_csv(ref/f'ref_shard{i}.csv') for i in range(${NSHARD})]
+df = pd.concat(parts, ignore_index=True)
+want = set(json.loads((ref/'subset12000.json').read_text()))
+have = set(df['SampleName'])
+missing, dup = want - have, len(df) - df['SampleName'].nunique()
+empty = int((df['Pred_report'].fillna('').str.strip() == '').sum())
+print(f'  rows {len(df)}  unique {df[\"SampleName\"].nunique()}  dup {dup}  missing {len(missing)}  empty {empty}')
+assert not missing, f'{len(missing)} names missing, e.g. {sorted(missing)[:3]}'
+assert dup == 0, 'duplicate SampleName across shards'
+assert empty == 0, f'{empty} empty predictions -- BLEU floor 에 구멍이 생긴다'
+df.to_csv(ref/'ref_train12000.csv', index=False)
+print(f'  -> {ref}/ref_train12000.csv')
+PY" || { echo "ERROR: 결합/검사 실패" >&2; exit 1; }
+
+echo ">>> floor + corpus + sigma"
+singularity exec --nv -B /vf,/data,/spin1 "$SIF" bash -lc \
+    "source ${REPO}/.venv/bin/activate && cd ${REPO} && \
+     python scripts/build_grpo_reference_crgf1bleu.py \
+        --pred_csv '${REF}/ref_train12000.csv' \
+        --subset_json '${REF}/subset12000.json' \
+        --subset_meta '${REF}/subset12000_meta.json' \
+        --out '${REF}/reference.json'" || exit 1
+
+ls -la "${REF}/"
+echo "=============================================================="
+echo " done $(date '+%F %T').  다음: Phase B"
+echo "   sbatch --partition interactive --time 1-12:00:00 run_sbatch_grpo_newencB"
+echo "=============================================================="

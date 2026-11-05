@@ -1,0 +1,162 @@
+#!/bin/bash
+# ==============================================================================
+# Visual-token ablation launcher for the CTRG-3D (Qwen3-8B + open-source
+# Pillar-0 chest CT) run.
+#
+#   sbatch run_sbatch_vt 128
+#   sbatch run_sbatch_vt 512
+#   sbatch run_sbatch_vt 1024
+#
+# Token-weighted arm (same launcher, $2 picks the config):
+#   LABEL_TOKEN_WEIGHT=5.0 sbatch --job-name ctrg-tw5 \
+#       run_sbatch_vt 128 qwen3_joint_template_tokenweight
+#
+# $1 = number of visual tokens per volume (PerceiverResampler latents =
+# <image_ct*> prompt placeholders). configs/train/qwen3_joint_template.sh
+# derives experiment_name, max_seq and the batch/accumulation split from it, so
+# this launcher only has to pass the one number -- see the measured table in
+# that config. Anything other than 128/512/1024 aborts there unless you also
+# export MAX_SEQ, because max_seq has to be re-measured per token count.
+#
+# Monitoring:
+#   squeue -u $USER -o "%.18i %.12j %.2t %.10M %.20R"
+#   sacct -S today --format=JobID,JobName%24,State,Elapsed,ExitCode | grep ctrg-vt
+#   tail -f ${LOG_DIR:-./logs}/ctrg-vt<N>-<JOBID>.out
+# ==============================================================================
+
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+########## gpu (a100) 스펙: Cores 32, CPUs 64, GPUs 4, Mem 243g
+
+# scripts/train.sh launches torchrun --nproc_per_node=2 (from SLURM_GPUS_ON_NODE),
+# so each arm takes 2 A100s.
+#
+# 3 days, down from 5: a shorter walltime schedules sooner (it backfills), and
+# the estimate says 8 epochs fit with ~30% headroom. Derivation from the
+# previous run's measured 68h17m for 10 epochs (bs4/accum2, max_seq 4096,
+# 32,768 encoder tokens, einsum perceiver) = 8.2 s per bs4 micro-step, of which
+# the LoRA'd LLM with gradient checkpointing is ~7.5 s (~1 PFLOP). Scaling that
+# by tokens-per-micro-step and adding the measured encoder (129 ms/sample) and
+# perceiver (SDPA, batch 8) costs, at bs8/accum1:
+#     vt128  (L2688): ~10.6 s/step x 1492 steps = 4.4 h/epoch -> ~37 h total
+#     vt512  (L3072): ~12.5 s/step             = 5.2 h/epoch -> ~45 h total
+#     vt1024 (L3584): ~14.5 s/step             = 6.0 h/epoch -> ~50 h total
+# (plus ~15 min/epoch for the 1,552-sample eval loop). Checkpoints are written
+# every epoch, so even a timeout leaves usable ones -- and the previous run's
+# eval_loss bottomed at epoch 8 anyway.
+#
+# --mem 120g = 243 * 2/4, this cluster's normal 2-GPU share. Both torchrun ranks
+# independently materialize a full fp32 Qwen3-8B on CPU (~32g each) before
+# DeepSpeed ZeRO-2 shards it; a single such load was OOM-killed at ~37g with no
+# --mem set.
+#SBATCH --job-name ctrg-newenc
+#SBATCH --time 3-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:2
+#SBATCH --cpus-per-task=32
+#SBATCH --mem 120g
+
+set -euo pipefail
+
+NUM_VISUAL_TOKENS="${1:-}"
+if [ -z "$NUM_VISUAL_TOKENS" ]; then
+    echo "Usage: sbatch run_sbatch_vt <num_visual_tokens>   (128 | 512 | 1024)" >&2
+    exit 1
+fi
+export NUM_VISUAL_TOKENS
+
+# $2 = optional train config basename under configs/train/. Defaults to the
+# baseline, so `sbatch run_sbatch_vt 128` is unchanged. Pass
+# qwen3_joint_template_tokenweight (with LABEL_TOKEN_WEIGHT exported) to run the
+# token-weighted arm through this same launcher rather than duplicating it --
+# the OOM ladder and the memory reasoning below apply identically.
+TRAIN_CONFIG="${2:-qwen3_joint_template_new_encoder_template}"
+
+echo "자동으로 계산된 CPU 개수: $(nproc)"
+echo "num_visual_tokens = ${NUM_VISUAL_TOKENS}"
+echo "train config      = ${TRAIN_CONFIG}"
+echo "label_token_weight= ${LABEL_TOKEN_WEIGHT:-1.0 (baseline, weighting off)}"
+
+# Define Variables
+export WANDB_PROJECT="PETRG-3D"
+# W&B needs either an API key exported in the submitting shell or offline mode.
+# Falling back to offline rather than refusing to launch: the run is what
+# matters, and `wandb sync <dir>` uploads the curves afterwards.
+if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE=offline
+    echo "WARNING: WANDB_API_KEY not set -- logging offline; sync later with 'wandb sync'."
+fi
+export LANG_ENCODER_PATH="/data/drdcad/sunggu/llm_models/Qwen3-8B"
+# TOKENIZER_PATH defaults to LANG_ENCODER_PATH in the config; PRETRAINED_VISUAL_ENCODER
+# is intentionally left unset (Atlas vision encoder self-loads via model_config_yaml).
+
+# Batch sizes are chosen to fill the 80GB cards by estimate (see the config's
+# batch-size table); expandable segments soften fragmentation at high usage.
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+module load singularity
+
+######### Start container with Singularity
+# DeepSpeed compiles CUDA ops and needs CUDA_HOME, which the bare host does not
+# have -- hence the devel image. PETRG-3D has no pyproject.toml/uv.lock, just a
+# prebuilt .venv, so we source it directly instead of `uv run`.
+run_training() {
+    singularity exec --nv \
+        -B /vf,/data,/spin1 \
+        -B /data/drdcad/sunggu:/workspace \
+        -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+        --env NUM_VISUAL_TOKENS="${NUM_VISUAL_TOKENS}" \
+        --env PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-}" \
+        --env GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-}" \
+        --env PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
+        --env LABEL_TOKEN_WEIGHT="${LABEL_TOKEN_WEIGHT:-}" \
+        "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+        bash -lc "source /data/drdcad/sunggu/0.Challenge/PETRG-3D/.venv/bin/activate && \
+            cd /data/drdcad/sunggu/0.Challenge/PETRG-3D/scripts && \
+            bash train.sh ${TRAIN_CONFIG}"
+}
+
+# OOM safety net. The batch sizes deliberately run the cards near full, and a
+# start-up OOM surfaces within the first training steps, so an early failure is
+# retried one rung down while a late one is not (restarting the Trainer with the
+# same output_dir would run from step 0 over the epoch checkpoints already
+# written).
+#
+# Ladder: 24x1 -> 12x2 -> 8x3 -> 6x4, all of which keep the GLOBAL batch at 48
+# (only per_device affects memory; accum just splits the step). Global 48, not the
+# parent launcher's 16: the single-scale readout frees the 17.9 GB the perceiver
+# spent on 65,536 keys, and per_device is the only way to spend that (accum does
+# not change memory). The card gets filled on purpose -- estimated ~74 of 80 GB at
+# the first rung -- because leaving 25 GB idle is waste, and this ladder is exactly
+# what makes starting high cheap: a start-up OOM costs one rung and a few minutes.
+# The rungs exist because the encoder-transient part of that budget is an estimate.
+# If the first rung survives 30 minutes, per_device 24 is real, not estimated.
+#
+# This launcher exists rather than an edit to run_sbatch_vt because that file
+# hardcodes the global-16 ladder and EXPORTS per_device, which would override
+# whatever the config asks for -- silently putting this arm back at global 16.
+#
+# `set -- $attempt` clobbers the positional parameters, which is safe here:
+# NUM_VISUAL_TOKENS was captured from $1 and exported above.
+for attempt in "24 1" "12 2" "8 3" "6 4"; do
+    set -- $attempt
+    export PER_DEVICE_TRAIN_BATCH_SIZE="$1" GRADIENT_ACCUMULATION_STEPS="$2"
+    echo "=== attempt: per_device_batch=$1, accum=$2 (global 48) ==="
+    START_S=$SECONDS
+    if run_training; then
+        exit 0
+    fi
+    ELAPSED=$((SECONDS - START_S))
+    if [ "$ELAPSED" -ge 1800 ]; then
+        echo "ERROR: training failed after ${ELAPSED}s -- not retrying. A late" \
+             "failure is not an OOM at start-up, and restarting would run from" \
+             "step 0 over the epoch checkpoints already written." >&2
+        exit 1
+    fi
+    echo "WARNING: attempt died after ${ELAPSED}s (looks like start-up OOM); stepping down." >&2
+done
+echo "ERROR: all batch configurations failed." >&2
+exit 1

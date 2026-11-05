@@ -1,0 +1,33 @@
+# Pinned to the PETRG-3D inference environment (its .venv / requirements.txt)
+# except where a package is only needed by the vendored pillar/rve code.
+# torch is installed separately in the Dockerfile (CUDA-matched wheel).
+
+transformers==4.57.0
+peft==0.17.1
+safetensors==0.7.0
+accelerate>=1.0.0
+einops==0.8.2
+einops_exts==0.0.4
+easydict>=1.13
+timm>=1.0.0
+scipy
+numpy<2.3
+pandas
+PyYAML>=5.4.0
+tqdm
+
+# CTRATEDataset (vendored prompt/dataset module) imports
+# (upper bounds: the image runs python3.9 — monai>=1.5 / nibabel>=5.4 need 3.10;
+#  both packages are import-only dependencies of the vendored dataset module)
+monai<1.5
+nibabel>=5.0,<5.4
+
+# rad-vision-engine (rve) runtime deps — mirror of its requirements.txt core
+Pillow>=8.0.0
+lz4>=4.0.0
+opencv-python-headless>=4.0.0
+pydicom>=2.3.0
+SimpleITK>=2.1.0
+torchio>=0.18.0
+scikit-image>=0.18.0
+matplotlib>=3.5.0

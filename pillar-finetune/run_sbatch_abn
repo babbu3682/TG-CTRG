@@ -1,0 +1,250 @@
+#!/bin/bash
+
+# Abn classification task launcher (the single canonical entry point for this
+# task — see run_sbatch_ret for the retrieval counterpart, and
+# run_sbatch_abn_probe_revise for the standalone frozen-feature linear/MLP
+# probing pipeline used to quickly compare pretrain checkpoints).
+#
+# Usage: sbatch run_sbatch_abn [config_file] [exp_name] [notes]
+#   (forwarded to scripts/run_ctrate_abnclass.sh — see that file for details)
+# When running a comparison variant, pass a distinct exp_name AND override
+# --job-name so it's distinguishable both in squeue/sacct and in its
+# checkpoints directory (logs/CTRATE/<exp_name>/).
+# 실제 제출한 커맨드 기록은 이 파일 맨 아래 참고.
+#
+# sacct -r gpu -S 2026-06-01 --format=JobID,JobName%20,Partition,State,Start,End,ExitCode,NodeList | grep finetune_abn
+
+# SBatch Logging and mailing
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%A.out
+#SBATCH --mail-user <your-email>
+#SBATCH --mail-type END,TIME_LIMIT_90
+#SBATCH --extra SLURM_MAIL_QUEUED_MINS=1,SLURM_MAIL_RUN_MINS=1
+
+########## SBatch Reservation and runtime : gpu (a100) 스펙: Cores 32, CPUs 64, GPUs 4, Mem 243g
+
+#SBATCH --job-name finetune_abn
+#SBATCH --time 5-00:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem 60g
+
+AVAILABLE_CPUS=$(nproc)
+echo "자동으로 계산된 CPU 개수: $AVAILABLE_CPUS"
+
+# ⚠️ WANDB_API_KEY는 저장소에 두지 않는다 — origin이 공용 저장소(YalaLab/pillar-finetune)라
+# 커밋하면 그대로 공개된다. /data/drdcad/sunggu/.wandb_key 에 export WANDB_API_KEY="..." 를
+# 한 줄로 두고(chmod 600) 여기서 읽는다. 없으면 조용히 넘어가지 않고 즉시 죽는다.
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-/data/drdcad/sunggu/.wandb_key}"
+if [ -z "${WANDB_API_KEY:-}" ] && [ -r "$WANDB_KEY_FILE" ]; then . "$WANDB_KEY_FILE"; fi
+: "${WANDB_API_KEY:?WANDB_API_KEY 없음 — $WANDB_KEY_FILE 을 만들거나 환경변수로 주세요}"
+export WANDB_API_KEY
+
+module load singularity
+
+# printf %q-escape each positional arg individually before interpolating into
+# the "bash -lc '<string>'" wrapper below — see run_sbatch_ret for why (job
+# 26976251 died to a shell syntax error from unescaped apostrophes in NOTES).
+QUOTED_ARGS=$(printf '%q ' "$1" "$2" "$3")
+
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "bash /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune/scripts/run_ctrate_abnclass.sh $QUOTED_ARGS"
+
+
+########## 제출 기록 (최신이 위)
+
+# label_adjust epoch_10 (phrase_align_polar + 4 판독자 병합 라벨 v5) + abn best setting — job 28122458
+#   체크포인트: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/logs/label_adjust/checkpoints/epoch_10.pt
+#   pretrain 런 label_adjust (job 28056570, 제출 시점 RUNNING). `--phrase_align-polar` + 규칙 태거 v5
+#   + PRESENT LLM 거부권 + 4단계 판정 잔여 447 문장 override. epoch_10이 val_loss 최저
+#   (chest_ct_clip_val_loss 4.8183, results.jsonl 17행 중 최소, ep14부터 재상승) — 사용자 지정
+#   epoch이 best와 일치함을 확인하고 제출.
+#   ⚠️ **아키텍처는 lapa와 동일하다.** phrase_align_polar는 loss와 phrase label(18-dim presence
+#   -> 58-dim polarity+anatomy `sentence_probs`)만 바꾸고, pillar-pretrain src/trainer/main.py:1006이
+#   `phrase_align_polar`일 때 `model_kwargs["lapa"] = True`로 강제해서 모델은 그대로
+#   CustomTextCLIP_LAPA다(코드로 확인). 그래서 finetune 쪽 백본 클래스
+#   (MultimodalAtlasSelfLAPA)/model_config/scale_index/input_dim 384를 하나도 안 바꿨다.
+#   실측: 두 체크포인트의 state_dict 키 752/752 동일, shape 불일치 0.
+#   config는 1등 config(..._self_lapa_maxpool.yaml)에서 **pretrained 한 줄 + exp_name/notes**
+#   만 바꾼 것 — readout/loss/optimizer/lr/batch 30/patience 10/lz4/aug 없음/--time 3d 전부 동일.
+#   standalone 검증(A100, 컨테이너): strict load 747/747 + 값 단위 전수 일치(0 mismatch),
+#   backbone 80,376,649 params, ckpt epoch=10 name='label_adjust', backbone.training=False(eval 고정),
+#   activ (2,384,16,8,8), pooled (2,384), abn (2,18) 전부 finite, MultiLabelWeightedBCELoss 2.2776,
+#   build_optimizer(layer_decay 0.9) 2 groups / 4 tensors / 412,690 params = requires_grad 합 일치.
+# sbatch --job-name=finetune_abn_label_adjust_maxpool --time=3-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_label_adjust_maxpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_label_adjust_maxpool \
+#     "abn best setting ... single-variable swap vs the 0.8730 baseline"
+
+
+# lapa (stride-corrected stem + 중간 hidden 단일 스케일 readout) epoch_12 + maxpool — job 27744448
+#   체크포인트: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/logs/lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt
+#   results.jsonl 50 rows(1-indexed 행 = epoch): epoch 12가 val_loss 최저(6.5927), 이후 재악화 —
+#   사용자 지정 epoch이 best와 일치함을 확인하고 제출.
+#   pretrain 변형(pillar-pretrain src/miniclip/multimodal_atlas_lapa.py)의 두 아키텍처
+#   변경을 finetune 쪽에 그대로 이식:
+#     1) ChestCTEmbed3D_Pillar0 stem — stride가 patch_size에서 유도되고 (H,W,D)->(D,H,W)로
+#        permute됨. patch [8,8,4] -> feature grid (D,H,W)=(64,32,32). 파라미터 이름/shape은
+#        ChestCTEmbed3D와 동일(stride는 학습 텐서가 아님)이라 strict load가 그대로 검증됨.
+#        pillar/models/backbones/atlas_encoders.py에 pretrain에서 복사.
+#     2) 단일 스케일(중간 hidden) readout — pretrain tower는 3-scale concat 없이
+#        scale_index=1(1024 토큰 x 384차원, h^(2))만 반환. 신규 백본
+#        MultimodalAtlasSelfLAPA(pillar/models/backbones/mmatlas_self_lapa.py,
+#        MultimodalAtlasSelf 상속)가 pooled = L2-normalized maxpool(scale-1 tokens) -> 384차원으로
+#        노출. vision_projector(384->1152, visual. 밖의 text-alignment 키)는 인코더 비교라 미로드.
+#   readout 레시피는 phrase_align_split maxpool 런(0.8634)과 동일(pooled maxpool -> MLP[1024],
+#   dropout 0.3, lr 3e-4, batch 30, patience 10) — head input_dim만 1152 -> 384.
+#   standalone 검증(컨테이너 CPU): strict load 747/747 + 로드 후 값 단위 전수 일치(0 mismatch),
+#   stem ds1_stride (1,2,2), patch-embed 출력 (1,384,64,32,32), pooled (1,384) L2=1.0,
+#   activ (1,384,16,8,8), abn logits (1,18), loss 1.9971, build_optimizer(layer_decay 경로)
+#   2 groups/4 tensors/412,690 params(=MLP head와 정확히 일치), eval() 전파 — 전부 통과 후 제출.
+# sbatch --job-name=finetune_abn_lapa_maxpool --time=3-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool \
+#     "lapa_pillar0_lz4_v1/epoch_12 (pretrain val_loss best 6.5927 of 50 epochs, frozen, eval-pinned): stride-corrected ChestCTEmbed3D_Pillar0 stem (patch [8,8,4], (D,H,W)=(64,32,32) grid) + intermediate-hidden readout (single scale_index=1, 1024 tokens x 384-d) -> pooled(fixed maxpool, L2) -> MLP[1024] head -- same winning maxpool recipe as phrase_align_split maxpool (0.8634), input_dim 384 instead of 1152"
+
+# VL-CABS 18-class positive-only logits -> MLP[1024] head — job 27236916
+#   phrase_align_split(epoch_10, frozen, no predictor) — attnpool(job 27186616)과 같은 체크포인트,
+#   readout만 다름. backbone_model_type: MultimodalAtlasVLCABS(신규,
+#   pillar/models/backbones/mmatlas_self_vlcabs.py) — MultimodalAtlasSelf를 그대로 상속해서
+#   encoder body 재사용, forward에서 18개 CT-RATE 클래스 positive prompt로 VL-CABS attention을
+#   걸어 PhraseAlignJepaLoss.get_logits 그대로(logit_scale.exp()*cos_sim [+logit_bias], negative 없음)
+#   18개 logit을 계산 -> outputs['pooled']로 노출. scripts/zeroshot_abn.py --image-readout
+#   phrase_align_phrase --positive-only가 이 18개 logit을 바로 sigmoid 치는 것과 정확히 같은 특징
+#   (그 zero-shot 결과가 macro_auroc 0.8446 — 지금까지 나온 zero-shot 중 전체 1등, CLAUDE.md
+#   "VL-CABS phrase 결과" 참고). 여기서는 그 18-dim 벡터에 학습 가능한 MLP를 얹어서 attnpool
+#   route(1152-dim activ -> MultiAttentionPool -> MLP)와 정면 비교.
+#   text tower(text.proj/logit_scale/temperature)와 VL-CABS 수식은 zeroshot_abn.py와 완전히
+#   같은 코드(pillar/utils/vlcabs.py로 공통 추출 — 원래 zeroshot_abn.py 안에 있던 걸 리팩터링,
+#   64샘플 회귀 테스트로 리팩터링 전후 macro_auroc 일관성 확인함). 18개 positive prompt는
+#   zeroshot_abn.py가 이미 만들어둔 캐시(abn_probe_cache/zeroshot_prompt_embeds.pt)에서 raw
+#   Qwen 임베딩만 읽어와 이 체크포인트의 text.proj로 투영 — 학습 job 안에서 Qwen3-8B를 로드하지
+#   않음(캐시가 없거나 report_templates와 안 맞으면 조용히 재인코딩하지 않고 명확히 에러).
+#   standalone 검증: 체크포인트 로드(747/747, 0 missing/unexpected), forward(abn logits (2,18),
+#   vlcabs_logits (2,18)), loss(3.2152), optimizer(2 groups, 4 tensors — Linear(18→1024)+
+#   Linear(1024→18) 파라미터 수와 정확히 일치, 37,906) 전부 통과. 추가로 백본이 계산한
+#   pos_embeds를 독립적으로 재계산한 값과 대조해서 18개 클래스 전부 코사인 1.0 확인.
+# sbatch --job-name=finetune_abn_phrase_align_split_vlcabs --time=3-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_phrase_align_split_vlcabs.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_phrase_align_split_vlcabs \
+#     "VL-CABS 18-class positive-only logits (PhraseAlignJepaLoss.get_logits formula, matches zeroshot_abn.py phrase_align_phrase --positive-only, zero-shot macro_auroc 0.8446) -> MLP[1024] head, phrase_align_split epoch_10, frozen -- compares against pooled-attnpool route on identical checkpoint"
+
+# self-pretrained 플레인(non-JEPA) PhraseAlign / PhraseAlign-Split, 2개 config — job 27186611, 27186616
+#   jepa_phrase_align*와는 다른 pretrain 런(phrase_align_pillar0_lz4_v1, phrase_align_split_pillar0_lz4_v1).
+#   train_unimodal_pillar0_ctrate_chest_ct_1node_phrase_align{,_split}.sh 자체 주석: "Ablation of
+#   jepa_phrase_align: same PhraseAlignJepaLoss, same hyperparameters, JEPA predictor removed". model_configs
+#   json도 jepa_phrase_align*와 vision_cfg.model_name만 다르고 architecture 필드는 동일함을 diff로 확인.
+#   두 pretrain job(new_phrase_align_d3g2/new_phrase_align_split_d3g2)이 아직 진행 중(2026-08-11 시작)이라
+#   "완료된 최선"이 아니라 "지금까지의 최선"을 씀 — results.jsonl: phrase_align는 29 epoch 중 epoch 20이
+#   최저(5.466, 이후 9epoch 갱신 못 함), phrase_align_split은 20 epoch 중 epoch 10이 최저(6.9105, 이후
+#   10epoch 갱신 못 함). 체크포인트 state_dict는 `module.` DDP prefix 붙어있음(설계상 자동 strip됨,
+#   mmatlas_self.py:140) + predictor.* 키 0개(이 pretrain 변형엔 predictor 자체가 없음) — 그래서
+#   backbone_model_type은 MultimodalAtlasSelfJEPA가 아니라 MultimodalAtlasSelf(use_predictor kwarg
+#   자체가 없음). standalone 검증(체크포인트 로드 747/747 matched 0 missing/0 unexpected, forward,
+#   loss, build_optimizer) 전부 통과 후 제출. 처음엔 --time 없이 제출했다가 오늘 낮에 겪은 backfill
+#   교훈(9일→5일이 스케줄링을 풀어줬던 사례) 반영해서 처음부터 3일로 제출함.
+# sbatch --job-name=finetune_abn_phrase_align_attnpool --time=3-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_phrase_align_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_phrase_align_attnpool \
+#     "PhraseAlign(non-JEPA, epoch_20 best-so-far) encoder, activ->MultiAttentionPool->MLP[1024], predictor never existed in this checkpoint"
+# sbatch --job-name=finetune_abn_phrase_align_split_attnpool --time=3-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_phrase_align_split_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_phrase_align_split_attnpool \
+#     "PhraseAlign-Split(non-JEPA, epoch_10 best-so-far) encoder, activ->MultiAttentionPool->MLP[1024], predictor never existed in this checkpoint"
+
+
+# self-pretrained JEPA-PhraseAlign-Split, 2개 config (jepa_phrase_align_split_pillar0_lz4_v1 / epoch_16) — job 27137708, 27137718
+#   split 체크포인트는 이전 두 JEPA(jepa/jepa_phrase_align)와 predictor 입력 방향이 반대임을
+#   코드로 확인(pillar-pretrain/src/miniclip/multimodal_atlas_jepa_phrase_align_split.py의
+#   vision tower가 x(pooled)/outs(activ) 둘 다 반환하고, CustomTextCLIP_JEPA_PhraseAlign_Split
+#   .forward가 predictor에는 x만 넘김 — outs는 predictor 없이 PhraseAlign local loss에 씀).
+#   그래서 mmatlas_self_jepa.py에 predictor_input(activ/pooled) kwarg를 추가함.
+#   predictor_input=pooled면 토큰 513개뿐이라 activ-fed predictor job보다 ~20배 저렴
+#   (batch=30, 1.353s/batch) — batch_size/max_epochs/walltime 전부 정상값 사용.
+# Config A(activ->attnpool, predictor off):
+# sbatch --job-name=finetune_abn_jepa_phrase_align_split_attnpool run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_jepa_phrase_align_split_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_jepa_phrase_align_split_attnpool \
+#     "JEPA-PhraseAlign-Split-pretrained jepa_phrase_align_split_pillar0_lz4_v1/epoch_16 (frozen, eval-pinned, predictor OFF): activ -> MultiAttentionPool -> MLP[1024] head, MultiLabelWeightedBCELoss, lz4 cache -- encoder-only comparison"
+# Config B(pooled->predictor->MLP, predictor_input: pooled):
+# sbatch --job-name=finetune_abn_jepa_phrase_align_split_predictor run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_jepa_phrase_align_split.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_jepa_phrase_align_split_predictor \
+#     "self-pretrained JEPA-PhraseAlign-Split jepa_phrase_align_split_pillar0_lz4_v1/epoch_16 (frozen, eval-pinned), use_predictor=True predictor_input=pooled: pooled encoder vector(NOT activ, matches how this checkpoint's predictor was actually pretrained -- CustomTextCLIP_JEPA_PhraseAlign_Split feeds predictor x not outs) -> JEPA_Predictor(Llama-3.2-1B x8 layers) -> MLP[1024] head, MultiLabelWeightedBCELoss, lz4 cache, batch_size=30 (cheap: predictor only sees 513 tokens not 33280)"
+
+
+# self-pretrained JEPA-PhraseAlign encoder, predictor OFF, attnpool (jepa_phrase_align_pillar0_lz4_v1 / epoch_21) — job 27135292
+#   plain JEPA(jepa_pillar0_lz4_v1)와 아키텍처 동일(model_config json은 model_name만 다름),
+#   체크포인트 구조도 동일(visual 747 / predictor 78). use_predictor: False로 encoder만.
+#   epoch_21은 그 pretrain 런의 32개 체크포인트 중 val_loss 최저(4.876, results.jsonl 확인).
+# sbatch --job-name=finetune_abn_jepa_phrase_align_attnpool run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_jepa_phrase_align_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_jepa_phrase_align_attnpool \
+#     "JEPA-PhraseAlign-pretrained jepa_phrase_align_pillar0_lz4_v1/epoch_21 (frozen, eval-pinned, predictor OFF): activ -> MultiAttentionPool -> MLP[1024] head, MultiLabelWeightedBCELoss, lz4 cache -- tests whether JEPA-PhraseAlign pretraining alone (no predictor at inference) beats plain JEPA, plain self-pretrained (0.8471), or opensource (0.8568) under identical attnpool readout"
+
+
+# self-pretrained JEPA encoder, predictor OFF, attnpool (jepa_pillar0_lz4_v1 / epoch_5) — job 27134403
+#   backbone_model_type: MultimodalAtlasSelfJEPA, use_predictor: False. predictor를 아예
+#   안 만들고 안 씀 -> 다른 attnpool 실험들과 동일하게 activ -> MultiAttentionPool ->
+#   MLP[1024]. 위 predictor-on job과 대조군: "JEPA pretrain 자체가(predictor 없이도)
+#   더 나은 encoder를 만드는가"만 순수하게 봄. batch_size/max_epochs도 다른 attnpool
+#   실험과 동일(30/50)로 복원 — predictor 비용이 없어서 저렴함.
+# sbatch --job-name=finetune_abn_jepa_attnpool run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_jepa_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_jepa_attnpool \
+#     "JEPA-pretrained jepa_pillar0_lz4_v1/epoch_5 (frozen, eval-pinned, predictor OFF): activ -> MultiAttentionPool -> MLP[1024] head, MultiLabelWeightedBCELoss, lz4 cache -- tests whether JEPA-style pretraining alone (no predictor at inference) beats plain self-pretrained (0.8471) or opensource (0.8568) under identical attnpool readout"
+
+
+# self-pretrained JEPA encoder + predictor ON (jepa_pillar0_lz4_v1 / epoch_5) — job 27133355
+#   backbone_model_type: MultimodalAtlasSelfJEPA, use_predictor: True. predictor는 activ
+#   토큰 전체(32768개, pretrain과 동일)를 받아 Llama-3.2-1B 8-layer로 pooled(1152)를
+#   만들고, 그걸 MLP[1024] head가 받음(attnpool 구조 아님 — pool_name 생략).
+#   비용 큼: 프로파일링 결과 샘플당 1.454s(encoder 4%, predictor의 self-attn이 92%,
+#   O(33280^2) full attention). batch_size=8, epoch당 ~10.3h, engine.max_epochs=20으로
+#   상한(worst case ~8.6일). 처음엔 --time=9-00:00:00로 제출했는데, 긴 walltime 요청이
+#   스케줄러 우선순위를 밀어내서 PD(Priority)로 계속 대기하길래
+#   `scontrol update JobId=27133355 TimeLimit=5-00:00:00`로 5일로 재조정함(대기 사유
+#   Priority -> None으로 확인). ~5.15일 추정치 경계라 walltime에 잘릴 수도 있지만
+#   ckpt_freq:1이라 그때까지 진행분은 비교에 쓸 수 있음.
+#   자세한 내용/버그 6개 수정 목록은 CLAUDE.md "JEPA predictor 켜서 비교" 참고.
+# sbatch --job-name=finetune_abn_jepa --time=9-00:00:00 run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_jepa.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_jepa_predictor \
+#     "self-pretrained JEPA jepa_pillar0_lz4_v1/epoch_5 (frozen, eval-pinned), use_predictor=True: activ tokens(32768) -> JEPA_Predictor(Llama-3.2-1B x8 layers) -> pooled(1152) -> MLP[1024] head, MultiLabelWeightedBCELoss, lz4 cache, batch_size=8 -- encoder-quality comparison including the JEPA predictor transform"
+
+
+# self-pretrained encoder (pillar0_lz4_v1 / epoch_10) — job 27083948
+#   오픈소스 Pillar0-ChestCT 대신 직접 pretrain한 raw .pt 체크포인트로 인코더 품질 비교.
+#   나머지(frozen+eval-pin, MultiAttentionPool -> MLP[1024], BCE, lz4, early stop) 동일.
+#   결과: best val_macro_auroc 0.8471 (epoch 0), epoch 12 early stop. 오픈소스 0.8568 대비 0.010 낮음.
+#         epoch_10은 이 pretrain 런의 최선 체크포인트가 맞음 — results.jsonl 확인 결과
+#         val_loss가 epoch 10(1.4377)에서 최저였고 이후 epoch 44(2.4768)까지 계속 악화.
+#         (즉 "더 늦은 체크포인트로 돌리면 낫다"는 건 사실이 아님.)
+#   제출까지 3번 실패:
+#     27045800 -> MultiStage.stages()의 .visual        수정
+#     27049385 -> lr_decay.py의 .visual (죽은 변수)     삭제 (저장소 전체 grep 안 해서 놓침)
+#     27083744 -> pin memory CUDA error (노드 FreeMem 24GB) -> prefetch_factor 2->1
+
+# sbatch --job-name=finetune_abn_self run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_self_attnpool.yaml \
+#     CTRATE_FT_Atlas_abn_bce_self_attnpool \
+#     "self-pretrained pillar0_lz4_v1/epoch_10 (frozen, eval-pinned), activ -> MultiAttentionPool -> MLP[1024], MultiLabelWeightedBCELoss, lz4 cache, early stopping -- encoder comparison vs opensource attnpool. Retry #3: prefetch_factor 2->1 after pin-memory CUDA error on a low-free-memory node"
+
+
+# opensource + rotation augmentation — job 27014193, COMPLETED
+#   결과: epoch 0에서 val_macro_auroc 0.8556 정점 -> 이후 계속 하락, epoch 10 early stop.
+#   augmentation 없는 버전과 거의 동일한 궤적이라 regularizer 효과 없었음.
+# sbatch --job-name=finetune_abn_aug run_sbatch_abn \
+#     configs/ctrate_abnclass_finetune_lz4_pillar_opensource_attnpool_aug.yaml \
+#     CTRATE_FT_Atlas_abn_bce_attnpool_aug \
+#     "activ -> MultiAttentionPool -> MLP[1024], MultiLabelWeightedBCELoss, lz4 cache, early stopping, WITH train-time 3D rotation aug (backbone pretrained with same aug type) -- comparison against job 26976134's no-aug run which overfit from epoch 0"
+
+
+# opensource, augmentation 없음 (기본 config) — job 26976134
+#   결과: epoch 0에서 val_macro_auroc 0.8568 정점 -> 이후 하락, epoch 10 early stop.
+#   (SLURM 상태는 FAILED로 찍혔지만 학습 자체는 정상 완료 — 종료 후 NFS Stale file handle 글리치)
+# sbatch run_sbatch_abn

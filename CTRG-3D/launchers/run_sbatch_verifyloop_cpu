@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# 병합 결과를 문서 단위 read-back 으로 검증하고 기운 뒤 채점한다.  GPU 불필요.
+#   sbatch run_sbatch_verifyloop_cpu <OUTTAG> <MERGED_TAG> <max_add> <drop_extra:0|1> <draw> [<draw>...]
+# draw 는 results/ 아래 상대 경로 없이 "<sub>/<tag>" 형태.
+# ==============================================================================
+#SBATCH --job-name ctrg-vloop-cpu
+#SBATCH --partition norm
+#SBATCH --cpus-per-task 16
+#SBATCH --mem 100g
+#SBATCH --time 8:00:00
+#SBATCH --output ${LOG_DIR:-./logs}/%x-%j.out
+set -euo pipefail
+cd /vf/users/drdcad/sunggu/0.Challenge/PETRG-3D
+
+TAG=${1:?OUTTAG}; MTAG=${2:?MERGED_TAG}; MAXADD=${3:-3}; DROP=${4:-0}; shift 4
+[ $# -ge 2 ] || { echo "draw 가 2개 미만"; exit 1; }
+DRAWS=(); for d in "$@"; do DRAWS+=("results/$d.csv"); done
+
+SUB=grpo_newencB
+OUT=results/$SUB/$TAG.csv
+MERGED=results/$SUB/$MTAG.csv
+PY="uv run --no-project --python .venv/bin/python python"
+export CUDA_VISIBLE_DEVICES=""      # 학습 중인 GPU 를 건드리지 않는다
+
+echo " verify-loop  tag=$TAG  merged=$MTAG  max_add=$MAXADD  drop_extra=$DROP"
+echo " draws(${#DRAWS[@]}): $*"
+for f in "$MERGED" "${DRAWS[@]}"; do
+    [ -f "$f" ] || { echo "없음: $f"; exit 1; }
+    lp="${f%.csv}/vlm3d_eval/inferred_labels.csv"
+    if [ "$f" != "$MERGED" ] && [ ! -f "$lp" ]; then echo "라벨 없음: $lp"; exit 1; fi
+done
+
+EXTRA=""; [ "$DROP" = 1 ] && EXTRA="--drop_extra"
+$PY scripts/repair_verify_loop.py \
+    --merged "$MERGED" --draws "${DRAWS[@]}" --min_support "${K:-2}" \
+    --out "$OUT" --iters "${ITERS:-2}" --max_add "$MAXADD" $EXTRA \
+    --label_cache "${LABEL_CACHE:-data/tmp_sentlab_${TAG}.npz}" \
+    --check_against "$MTAG"
+
+$PY src/evaluate_reportgen.py --result_csv "$OUT" \
+    --split_json_path /data/drdcad/sunggu/0.Challenge/pillar-pretrain/data/merged_valid_filtered_prob_half.json \
+    --out_dir "results/$SUB/$TAG/vlm3d_eval" \
+    --radbert_model_path data/radbert/RadBertClassifier.pth \
+    --radbert_dir /data/drdcad/sunggu/0.Challenge/VLM3D-Dockers/ct_challenges/reportgen_evaluation/assets/radbert_local
+
+$PY - <<EOF
+import json
+for t in ["$MTAG", "$TAG"]:
+    m=json.load(open(f"results/$SUB/{t}/vlm3d_eval/metrics.json"))
+    c=m["crg"]["CRG"]; f=m["classification"]["macro"]["f1"]; b=m["generation"]["BLEU_mean"]
+    print(f"  {t:14s} CRG {c:.4f}  F1 {f:.4f}  BLEU {b:.5f}  ==> 합 {c+f+b:.4f}")
+print("  현재 1위 800_x5b4 = 1.5307 / BLEU 하한 0.3194")
+EOF

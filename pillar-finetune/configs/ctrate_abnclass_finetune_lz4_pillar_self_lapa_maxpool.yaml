@@ -1,0 +1,286 @@
+# CTRATE abn multi-label classification — lapa_pillar0_lz4_v1/checkpoints/epoch_12
+# (pretrain val_loss 최저: 6.5927 @ epoch 12, 50 epoch 중 — 이후 재악화, results.jsonl 확인)
+#
+# `lapa` pretrain 변형의 두 가지 아키텍처 변경을 그대로 반영한 비교 런
+# (pillar-pretrain src/miniclip/multimodal_atlas_lapa.py 참고):
+#
+#   1. patch_size [8,8,4] + stride 교정 stem(ChestCTEmbed3D_Pillar0):
+#      stride가 patch_size에서 유도되고 (H,W,D)->(D,H,W)로 올바르게 permute됨.
+#      256^3 볼륨 -> (D,H,W)=(64,32,32) feature map, 스케일별 65536/1024/16 토큰.
+#   2. 중간 hidden(단일 스케일) readout: pretrain tower가 3-scale concat 없이
+#      scale_index=1(1024 토큰 x 384차원, h^(2))만 반환하므로, 여기서도 그 스케일의
+#      토큰만 사용. pooled = L2-normalized maxpool(scale-1 tokens) -> 384차원.
+#      (vision_projector(384->1152, text-alignment 사영)는 인코더 비교이므로 미사용 —
+#      다른 maxpool/attnpool 런들도 인코더 native feature를 쓰는 것과 동일한 기준.)
+#
+# readout 구조 자체는 abn 1등 세팅(pooled 고정 maxpool + L2 -> MLP[1024], probe 승자
+# 0.8692 / phrase_align_split maxpool 0.8634)과 동일 — 차이는 입력 차원(1152 -> 384)뿐.
+#
+# pool_name은 의도적으로 생략 — head가 use_pooled_features: True로 outputs["pooled"]를 직접
+# 읽으므로 self.pool은 한 번도 호출되지 않는다(codebase 함정 #2).
+#
+# 나머지(loss / optimizer / lr / batch / early stopping / lz4 캐시 / aug 없음)는
+# ..._self_phrase_align_split_maxpool.yaml과 전부 동일하게 유지해서, 차이가 인코더(+그
+# 인코더가 요구하는 readout 차원)에서만 오도록 했다.
+
+experiment:
+  name: CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool
+  tags: ["ctrate", "atlas", "maxpool", "abn", "bce", "pillar0-self-lapa", "lz4"]
+  notes: "Fine-tuning Atlas(lapa_pillar0_lz4_v1/epoch_12, frozen, eval-pinned) for abn classification: intermediate-hidden readout (single scale_index=1, 1024 tokens x 384-d, stride-corrected ChestCTEmbed3D_Pillar0 stem, patch [8,8,4]) -> pooled(fixed maxpool, L2-normalized, 384-d) -> MLP[1024] head -- same winning maxpool readout recipe as phrase_align_split maxpool (0.8634), no augmentation."
+
+main:
+  exp_name: CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool
+  seed: 42
+  log_dir: ./logs
+  checkpoints_dir: ./logs/CTRATE
+  timestamp_save_dir: False
+
+  disable_wandb: False
+  wandb_offline: False
+  wandb_project: null
+  wandb_entity: null
+
+  ckpt_freq: 1
+  monitor: val_loss
+
+  allow_overwriting_experiment_checkpoints: True
+  find_unused_parameters: False
+  force_loading_train_dataloader: False
+
+  phases:
+    train: True
+    dev: True
+    test: True
+
+  freeze_backbone: "True"
+
+  # Stop once val_loss hasn't improved for this many consecutive epochs — same as
+  # every other encoder-comparison run.
+  early_stopping_patience: 10
+
+engine:
+  type: Classifier
+  max_epochs: 50
+  kwargs:
+    resume: null
+    accumulate_grad_batches: 1
+    precision: bf16-mixed
+    binary_pred: True
+    log_loss_components: True
+    log_interval: 50
+    limit_num_batches: null
+    # Same reasoning as every other frozen-backbone config: a frozen backbone
+    # can't adapt to augmented views, so it's off by default.
+    use_gpu_augs: False
+    train_gpu_augs:
+      - type: RandomRotation3D
+        kwargs:
+          degrees: [0.0, 0.0, 20.0]
+    test_gpu_augs: []
+
+dataloader:
+  batch_size: 30
+  eval_batch_size: 30
+  num_workers: 4
+  class_bal: False
+  train_drop_last: True
+  val_drop_last: False
+  multi_gpu_eval: True
+  persistent_workers: True
+  # Same pin-memory safety margin as the other self-pretrained configs (see
+  # ctrate_abnclass_finetune_lz4_pillar_self_attnpool.yaml for the incident this
+  # guards against — job 27083744 died on a low-FreeMem node at prefetch_factor=2).
+  prefetch_factor: 1
+  clip_grad: null
+  no_shuffle_training_set: False
+  use_null_collate: False
+  frac_train_samples: 1.0
+  no_cache_misses_allowed: False
+
+dataset:
+  type: CTRATE_ABN_Dataset
+  modality: CT
+  num_classes: 18
+  mode: "abn"
+  shared_dataset_kwargs:
+    anatomy: "chest_ct"
+    windows: 'all'
+    target_d: 256
+    target_hw: 256
+    pad_value: -1024
+    rve_root: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/
+
+  dataset_train_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_train_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/train/mapping_path.csv
+    is_train: True
+    label_csv: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/train_predicted_labels.csv
+  dataset_dev_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    label_csv: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/valid_predicted_labels.csv
+  dataset_test_kwargs:
+    json_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+    rve_manifest_path: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/ctrate/ctrate_cache_1.25mm_lz4/valid/mapping_path.csv
+    is_train: False
+    label_csv: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/valid_predicted_labels.csv
+
+
+model:
+  type: MultiStage
+  kwargs:
+    # pool_name 생략 -> 파라미터 없는 기본값 GlobalMaxPool로 폴백(codebase 함정 #2).
+    # head가 use_pooled_features: True라 self.pool은 호출되지 않는다.
+
+    backbone_model_type: MultimodalAtlasSelfLAPA
+    backbone_kwargs:
+      embed_dim: 384
+      image_size: 256
+      multiscale_feats: True
+      # 중간 hidden: 스케일 1(1024 토큰)만 readout — pretrain tower의 기본값과 동일.
+      scale_index: 1
+      pretrained: /data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/logs/lapa_pillar0_lz4_v1/checkpoints/epoch_12.pt
+      # model_config는 pretrain 쪽 model_configs json
+      # (Qwen3-Embedding-8B-Atlas_small_d2d2d8_multiscale__pillar0_multimodal_ucsf_chest_ct_multiwindow_lapa.json)
+      # 의 vision_cfg.model_config에서 그대로 복사 — patch_size가 [8,8,8]이 아니라 [8,8,4]다.
+      model_config:
+        modalities:
+          chest_ct:
+            image_size: [256, 256, 256]
+            in_chans: 11
+            local2global: [4, 4, 4]
+            merge_ratio: [4, 4, 4]
+            num_features: 192
+            patch_size: [8, 8, 4]
+        model:
+          atlas_args:
+            attn_drop: 0.0
+            class_token: False
+            dim: 384
+            drop: 0.0
+            drop_path_rate: 0.3
+            embed_dim: 384
+            global_pool: avg
+            in_chans: 1
+            in_dim: 64
+            mlp_ratio: 4.0
+            num_classes: 0
+            num_features: 192
+            num_heads: 6
+            num_scales: 3
+            pre_norm: False
+            qk_scale: False
+            qkv_bias: True
+          stages: [2, 2, 8]
+
+    head_models:
+      abn:
+        type: MultiLabelClassificationHead
+        kwargs:
+          # backbone의 outputs["pooled"] = normalize(maxpool(scale-1 tokens)), 384차원.
+          # hidden 1024 / dropout 0.3은 probe 승자와 동일 — 입력 차원만 1152 -> 384.
+          input_dim: 384
+          num_classes: 18
+          hidden_dim: 1024
+          dropout: 0.3
+        apply_pooling: False
+        use_pooled_features: True
+        enable_at_eval: True
+
+
+optimizer:
+  type: AdamW
+  kwargs:
+    lr: 3.0e-4
+    weight_decay: 0.0
+
+  scheduler:
+    interval: epoch
+    frequency: 1
+    type: CosineAnnealingWarmup
+    kwargs:
+      min_lr: 1.0e-5
+      warmup_epochs: 4
+      max_epochs: 50
+
+  layer_decay: 0.9
+
+metrics:
+  epoch_metrics:
+    train: &base_metrics
+      - type: AbnMetric
+        kwargs:
+          logit_key: abn
+          target_key: label
+    val: *base_metrics
+    test: *base_metrics
+
+  losses:
+    - type: MultiLabelWeightedBCELoss
+      weight: 1.0
+      kwargs:
+        logit_key: abn
+        target_key: label
+        pos_weight: null
+        pos_weight_max: null
+
+
+report_templates:
+  default_positive_threshold: 0.51
+  default_negative_threshold: 0.49
+  labels:
+    - name: "Medical material"
+      positive: "Medical material is present."
+      negative: "No medical material is present."
+    - name: "Arterial wall calcification"
+      positive: "Arterial wall calcification is present."
+      negative: "No arterial wall calcification is present."
+    - name: "Cardiomegaly"
+      positive: "Cardiomegaly is present."
+      negative: "No cardiomegaly is present."
+    - name: "Pericardial effusion"
+      positive: "Pericardial effusion is present."
+      negative: "No pericardial effusion is present."
+    - name: "Coronary artery wall calcification"
+      positive: "Coronary artery wall calcification is present."
+      negative: "No coronary artery wall calcification is present."
+    - name: "Hiatal hernia"
+      positive: "Hiatal hernia is present."
+      negative: "No hiatal hernia is present."
+    - name: "Lymphadenopathy"
+      positive: "Lymphadenopathy is present."
+      negative: "No lymphadenopathy is present."
+    - name: "Emphysema"
+      positive: "Emphysema is present."
+      negative: "No emphysema is present."
+    - name: "Atelectasis"
+      positive: "Atelectasis is present."
+      negative: "No atelectasis is present."
+    - name: "Lung nodule"
+      positive: "Lung nodule is present."
+      negative: "No lung nodule is present."
+    - name: "Lung opacity"
+      positive: "Lung opacity is present."
+      negative: "No lung opacity is present."
+    - name: "Pulmonary fibrotic sequela"
+      positive: "Pulmonary fibrotic sequela is present."
+      negative: "No pulmonary fibrotic sequela is present."
+    - name: "Pleural effusion"
+      positive: "Pleural effusion is present."
+      negative: "No pleural effusion is present."
+    - name: "Mosaic attenuation pattern"
+      positive: "Mosaic attenuation pattern is present."
+      negative: "No mosaic attenuation pattern is present."
+    - name: "Peribronchial thickening"
+      positive: "Peribronchial thickening is present."
+      negative: "No peribronchial thickening is present."
+    - name: "Consolidation"
+      positive: "Consolidation is present."
+      negative: "No consolidation is present."
+    - name: "Bronchiectasis"
+      positive: "Bronchiectasis is present."
+      negative: "No bronchiectasis is present."
+    - name: "Interlobular septal thickening"
+      positive: "Interlobular septal thickening is present."
+      negative: "No interlobular septal thickening is present."

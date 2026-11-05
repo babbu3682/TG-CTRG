@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# Score the retrieval model as *report generation*: run ret_inference.py, glue the
+# retrieved phrases into "sentence1. sentence2.", and hand that to the VLM3D
+# challenge's own scorer (BLEU/ROUGE/CIDEr/METEOR + RadBERT-inferred labels ->
+# macro-F1 + CRG). This is the one job that produces CRG / macro-F1 / BLEU_mean
+# for a retrieval checkpoint.
+#
+# Usage: sbatch run_sbatch_ret_reportgen [ckpt] [config] [out_dir] [thresholds] [split] [pp_overrides]
+#   [pp_overrides] (2026-08-24 신설, 선택): display_overrides json 경로. 주면 채점용 CSV를
+#     만들 때 `--display-overrides`를 붙여 **pp(표면형 치환) 적용 결과**를 낸다. CLAUDE.md가
+#     "채점은 반드시 --display-overrides data/display_overrides.json와 함께"라고 못박은 그 경로다.
+#     eval 디렉토리 태그가 th<thr> -> th<thr>_pp 로 바뀌므로 pp/nopp 산출물이 섞이지 않는다.
+#     **기본값은 빈 값 = 기존 동작(pp 없음)** 이라, 이 인자를 안 주면 과거 호출이 그대로 재현된다.
+#   defaults = the lapa run's current best.ckpt, threshold 0.4, dev split.
+#   [thresholds] may be a space-separated list ("0.4 0.5 0.6 0.7"): the encoder forward
+#   runs ONCE and every threshold is scored from that single pass. RA-RRG's 0.4 is the
+#   value that maximized example-F1 on *its* data (N=50, 7.16 phrases/exam, App. F.3);
+#   ours is N=64 / 15.2 sentences and fires 1.85x the ground-truth count at 0.4, so the
+#   threshold is a re-tuning target, not a constant to inherit.
+#
+# Why one job and not two: the RadBERT labeler and the retrieval encoder both want
+# the same GPU allocation, and the whole chain is ~20 min. --time is deliberately
+# short (1 h) so it backfills instead of queueing behind the long training jobs.
+#
+# Two environments on purpose (mirrors PETRG-3D/scripts/score_when_done.sh):
+#   * retrieval inference INSIDE the CUDA singularity image (pillar-finetune venv;
+#     importing `pillar` outside it dies on GLIBC_2.32 via kornia->flash_attn).
+#   * the scorer OUTSIDE any container -- pycocoevalcap's METEOR shells out to
+#     `java`, which the CUDA image does not have but the compute node does.
+
+#SBATCH --output /home/%u/logs/%x-%A.out
+#SBATCH --mail-type END
+#SBATCH --job-name ret_reportgen
+#SBATCH --time 1:00:00
+#SBATCH --partition gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem 48g
+
+set -uo pipefail
+
+REPO=/data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-finetune
+PETRG=/vf/users/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/PETRG-3D
+SCORER_PY="$PETRG/.venv/bin/python"
+
+SRC_CKPT="${1:-$REPO/logs/CTRATE/CTRATE_FT_Atlas_retrieval_self_lapa/checkpoints/best.ckpt}"
+CONFIG="${2:-configs/ctrate_retrieval_finetune_lz4_pillar_self_lapa.yaml}"
+OUT_DIR="${3:-$REPO/logs/CTRATE/CTRATE_FT_Atlas_retrieval_self_lapa/reportgen}"
+THRESHOLDS="${4:-0.4}"
+SPLIT="${5:-dev}"
+PP_OVERRIDES="${6:-}"
+read -r -a THR_ARR <<< "$THRESHOLDS"
+MULTI=0; [ "${#THR_ARR[@]}" -gt 1 ] && MULTI=1
+
+SPLIT_JSON=/data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/pillar-pretrain/data/merged_valid_filtered_prob_half.json
+RADBERT_CKPT=/data/MIDS/datasets/CT-RATE/models/RadBertClassifier.pth
+RADBERT_DIR=/data/drdcad/sunggu/0.Challenge/VLM3D_MICCAI/VLM3D-Dockers/ct_challenges/reportgen_evaluation/assets/radbert_local
+
+# 스코어러 단계는 `cd "$PETRG"` 안에서 돌기 때문에 OUT_DIR 이 상대 경로면 --result_csv 가
+# 해석되지 않는다(2026-08-30 에 실제로 FileNotFoundError 로 죽었다). 여기서 절대화한다.
+case "$OUT_DIR" in /*) ;; *) OUT_DIR="$PWD/$OUT_DIR" ;; esac
+mkdir -p "$OUT_DIR"
+echo "=== ret_reportgen $(date '+%F %T')"
+echo "    ckpt      : $SRC_CKPT"
+echo "    config    : $CONFIG"
+echo "    threshold : ${THR_ARR[*]}   split: $SPLIT"
+echo "    pp        : ${PP_OVERRIDES:-(없음)}"
+echo "    out       : $OUT_DIR"
+
+CHECK_FILES=("$SRC_CKPT" "$REPO/$CONFIG" "$SPLIT_JSON" "$RADBERT_CKPT" "$RADBERT_DIR/config.json" "$SCORER_PY")
+[ -n "$PP_OVERRIDES" ] && CHECK_FILES+=("$PP_OVERRIDES")
+for f in "${CHECK_FILES[@]}"; do
+    [ -e "$f" ] || { echo "ERROR: missing $f" >&2; exit 1; }
+done
+
+# ---------------------------------------------------------------------------
+# 0. Stage the checkpoint.
+# best.ckpt belongs to a *still-running* training job that rewrites it whenever
+# val_loss improves; reading it in place risks a torn 1.5 GB file. Copy, then
+# prove the copy loads (retry once) before spending the GPU on it.
+# ---------------------------------------------------------------------------
+STAGED="$OUT_DIR/scored_checkpoint.ckpt"
+for attempt in 1 2 3; do
+    echo "=== staging checkpoint (attempt $attempt) $(date '+%F %T')"
+    cp -f "$SRC_CKPT" "$STAGED" || { echo "cp failed"; sleep 30; continue; }
+    if "$SCORER_PY" -c "
+import sys, torch
+ck = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
+print('  staged ok: epoch', ck.get('epoch'), '| keys', list(ck.keys())[:6])
+" "$STAGED"; then
+        STAGE_OK=1; break
+    fi
+    echo "  staged copy did not load (training job likely mid-write); retrying"
+    sleep 60
+done
+[ "${STAGE_OK:-0}" = 1 ] || { echo "ERROR: could not stage a loadable checkpoint" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 1. Retrieval inference -> retrieved phrases per exam (inside the container).
+# ---------------------------------------------------------------------------
+REPORTS_JSON="$OUT_DIR/${SPLIT}_ret_reports.json"
+echo "=== retrieval inference $(date '+%F %T')"
+module load singularity
+singularity exec --nv \
+    -B /vf,/data,/spin1 \
+    -B /data/drdcad/sunggu:/workspace \
+    -B /data/MIDS/datasets/CT-RATE:/workspace/0.Challenge/goto_dataset \
+    "/data/drdcad/sunggu/.singularity_images/cuda-12.2.2-cudnn8-devel-ubuntu22.04.sif" \
+    bash -lc "cd $REPO && CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 uv run python scripts/ret_inference.py $(printf '%q' "$CONFIG") \
+        --ckpt $(printf '%q' "$STAGED") \
+        --split $(printf '%q' "$SPLIT") \
+        --threshold ${THR_ARR[*]} \
+        --output $(printf '%q' "$OUT_DIR/${SPLIT}_ret_results.csv") \
+        --metrics-output $(printf '%q' "$OUT_DIR/${SPLIT}_ret_metrics.csv") \
+        --report-output $(printf '%q' "$REPORTS_JSON")"
+rc=$?
+[ $rc -eq 0 ] || { echo "ERROR: retrieval inference failed (rc=$rc)" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 2+3. Per threshold: phrases -> "sentence1. sentence2." CSV -> official scorer.
+# Deliberately no `set -e` around the body: one threshold failing (e.g. METEOR
+# needing java, RadBERT needing its .pth) must not discard the ones that scored.
+# ---------------------------------------------------------------------------
+FAILED=()
+for THR in "${THR_ARR[@]}"; do
+    if [ "$MULTI" = 1 ]; then
+        RJ="$OUT_DIR/${SPLIT}_ret_reports_th${THR}.json"; TAG="th${THR}"
+    else
+        RJ="$REPORTS_JSON"; TAG="th${THR}"
+    fi
+    # pp를 적용하면 태그를 분리한다 — 같은 out_dir에 pp/nopp를 섞으면 어느 쪽 숫자인지
+    # 사후에 구분할 수 없다(과거에 정확히 그 혼동이 있었다).
+    PP_ARGS=()
+    if [ -n "$PP_OVERRIDES" ]; then
+        PP_ARGS=(--display-overrides "$PP_OVERRIDES")
+        TAG="${TAG}_pp"
+    fi
+    [ -s "$RJ" ] || { echo "!! $RJ 없음, 건너뜀"; FAILED+=("$TAG:missing"); continue; }
+
+    RESULT_CSV="$OUT_DIR/${SPLIT}_reportgen_input_${TAG}.csv"
+    EVAL_DIR="$OUT_DIR/vlm3d_eval_${TAG}"
+    echo "=== [$TAG] building report CSV $(date '+%F %T')"
+    "$SCORER_PY" "$REPO/scripts/ret_reports_to_reportgen_csv.py" \
+        --reports-json "$RJ" --split-json "$SPLIT_JSON" --out-csv "$RESULT_CSV" \
+        "${PP_ARGS[@]+"${PP_ARGS[@]}"}" \
+        || { FAILED+=("$TAG:csv"); continue; }
+
+    echo "=== [$TAG] VLM3D scorer $(date '+%F %T')"
+    ( cd "$PETRG" && "$SCORER_PY" src/evaluate_reportgen.py \
+        --result_csv "$RESULT_CSV" \
+        --split_json_path "$SPLIT_JSON" \
+        --out_dir "$EVAL_DIR" \
+        --radbert_model_path "$RADBERT_CKPT" \
+        --radbert_dir "$RADBERT_DIR" ) || FAILED+=("$TAG:score")
+done
+
+echo
+echo "=== headline metrics (threshold sweep) ==="
+PP_SUFFIX=""; [ -n "$PP_OVERRIDES" ] && PP_SUFFIX="_pp"
+"$SCORER_PY" - "$OUT_DIR" "$SPLIT" "$PP_SUFFIX" "${THR_ARR[@]}" <<'PY'
+import json, sys, os, csv
+out_dir, split, suf, thrs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+print(f"{'thr':>6} {'CRG':>8} {'F1(macro)':>10} {'BLEU_mean':>10} {'문장/exam':>10}")
+rows = []
+for t in thrs:
+    mp = os.path.join(out_dir, f"vlm3d_eval_th{t}{suf}", "metrics.json")
+    if not os.path.exists(mp):
+        print(f"{t:>6} {'-':>8} {'-':>10} {'-':>10} {'-':>10}"); continue
+    m = json.load(open(mp))
+    cp = os.path.join(out_dir, f"{split}_reportgen_input_th{t}{suf}.csv")
+    n = "-"
+    if os.path.exists(cp):
+        rs = list(csv.DictReader(open(cp)))
+        n = f"{sum(r['Pred_report'].count('. ') + 1 for r in rs) / max(1, len(rs)):.2f}"
+    r = dict(thr=float(t), crg=m['crg']['CRG'], f1=m['classification']['macro']['f1'],
+             bleu=m['generation']['BLEU_mean'], sents=n)
+    rows.append(r)
+    print(f"{t:>6} {r['crg']:>8.4f} {r['f1']:>10.4f} {r['bleu']:>10.4f} {n:>10}")
+if rows:
+    with open(os.path.join(out_dir, f"threshold_sweep{suf}.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+    print("\n  -> " + os.path.join(out_dir, f"threshold_sweep{suf}.csv"))
+PY
+[ ${#FAILED[@]} -gt 0 ] && echo "== 실패: ${FAILED[*]}"
+
+# The 1.5 GB staged copy has served its purpose; the real checkpoint is untouched.
+rm -f "$STAGED"
+echo "=== done $(date '+%F %T') -> $OUT_DIR/vlm3d_eval_th*/metrics.json"
+exit 0

@@ -1,0 +1,23 @@
+{
+  "_note": "abn 1등 인코더(lapa_pillar0_lz4_v1/epoch_12) + CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool/best.ckpt(epoch 39) head 기준. scripts/tune_abn_thresholds.py로 train(23,869)에서 클래스별 F1 최대 임계값 적합. negative 생략 -> uncertain 구간 없이 18칸 전부 채움. dev macro-F1 0.6123 (전역 최적 0.65 -> 0.5900, 전역 0.7 -> 0.5820). 캐시 lapa_lz4_half + finetune_head.pt 경로에서만 유효 (docs/codebase-pitfalls.md의 Classifier minmax 항목 참고).",
+  "positive": {
+    "Medical material": 0.7168,
+    "Arterial wall calcification": 0.6224,
+    "Cardiomegaly": 0.7508,
+    "Pericardial effusion": 0.8095,
+    "Coronary artery wall calcification": 0.6997,
+    "Hiatal hernia": 0.6431,
+    "Lymphadenopathy": 0.5585,
+    "Emphysema": 0.6805,
+    "Atelectasis": 0.5592,
+    "Lung nodule": 0.4798,
+    "Lung opacity": 0.5218,
+    "Pulmonary fibrotic sequela": 0.5144,
+    "Pleural effusion": 0.8816,
+    "Mosaic attenuation pattern": 0.7386,
+    "Peribronchial thickening": 0.6896,
+    "Consolidation": 0.7552,
+    "Bronchiectasis": 0.6624,
+    "Interlobular septal thickening": 0.7709
+  }
+}
