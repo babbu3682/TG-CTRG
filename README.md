@@ -30,11 +30,11 @@ Validation split (1,552 studies, official scorer):
 
 ## Pretrained weights
 
-All checkpoints are hosted on Hugging Face: **`<HF_USER>/TG-CTRG`** (≈21 GB; Qwen3-8B is fetched separately).
+All checkpoints are hosted on Hugging Face: **[babbu3682/TG-CTRG](https://huggingface.co/babbu3682/TG-CTRG)** (≈21 GB; Qwen3-8B is fetched separately).
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-bash scripts/hf_download_weights.sh <HF_USER>/TG-CTRG docker/weights
+bash scripts/hf_download_weights.sh babbu3682/TG-CTRG docker/weights
 ```
 
 | file | component |
@@ -43,7 +43,7 @@ bash scripts/hf_download_weights.sh <HF_USER>/TG-CTRG docker/weights
 | `cls_finetune_head.pt`, `abn_thresholds_f1max_train_lapa.json` | CLS probe (stage 3) |
 | `ret_head.pt`, `gallery_embeddings_lasthidden.pt`, `gallery_sentences.pt` | RET head and gallery (stage 4) |
 | `ctrg3d/model.safetensors` | MLLM after SFT (stage 5) |
-| `lora/*.safetensors` | GRPO LoRA adapters (9 shipped; the ensemble uses 8) (stage 5) |
+| `lora/*.safetensors` | 8 GRPO LoRA adapters, one per ensemble draw slice (stage 5) |
 | `radbert/` | RadBERT labeler from the challenge evaluation kit |
 
 Qwen3-8B is downloaded separately from its own repository.
