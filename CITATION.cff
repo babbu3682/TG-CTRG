@@ -5,6 +5,12 @@ abstract: "2nd-place solution of the VLM3D Challenge 2026 (MICCAI) CT report gen
 authors:
   - family-names: Kyung
     given-names: Sunggu
+  - family-names: Jeong
+    given-names: Hyekyo
+  - family-names: Lim
+    given-names: Jongsoo
+  - family-names: Choi
+    given-names: Jiye
 version: "1.0.0"
 date-released: "2026-11-05"
 repository-code: "https://github.com/babbu3682/TG-CTRG"

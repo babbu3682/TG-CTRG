@@ -2,6 +2,8 @@
 
 2nd place, VLM3D Challenge 2026 — CT Report Generation (MICCAI 2026).
 
+Team: Sunggu Kyung (lead), Hyekyo Jeong, Jongsoo Lim, Jiye Choi.
+
 Chest CT volume → radiology report (Findings / Impression), trained on CT-RATE.
 Hidden test set: CRG 0.5562, macro-F1 0.6011, BLEU 0.2646.
 
@@ -9,28 +11,28 @@ Hidden test set: CRG 0.5562, macro-F1 0.6011, BLEU 0.2646.
 
 <p align="center"><img src="assets/pipeline.png" width="820"></p>
 
-| | component | code |
+| | stage | code |
 |---|---|---|
-| 1 | Preprocessing: 1.25 mm resampling, 256³, lossless LZ4 cache; sentence-level labels; Qwen3-Embedding-8B sentence embeddings | `rad-vision-engine/`, `pillar-pretrain/scripts/` |
-| 2 | 3D encoder: Pillar-0 continued-pretrained with a phrase-level vision–language objective (VL-CABS) | `pillar-pretrain/` |
-| 3 | CLS: 18-finding probe on the frozen encoder → 18 template sentences per study | `pillar-finetune/` |
-| 4 | RET: DETR-style retrieval head → sentences retrieved from a 79k-sentence gallery | `pillar-finetune/` |
-| 5 | MLLM: frozen encoder → Perceiver (128 tokens) → Qwen3-8B + LoRA, prompted with the CLS and RET templates; SFT with finding-weighted tokens, then GRPO post-training; 10-draw label-vote ensemble | `CTRG-3D/` |
-| 6 | Inference container (runs 1–5 end to end per volume) | `docker/` |
+| 1 | Preprocessing: resample to 1.25 mm, 256³ volumes, compressed cache; sentence-level finding labels; sentence embeddings | `rad-vision-engine/`, `pillar-pretrain/scripts/` |
+| 2 | Encoder: Pillar-0 continued-pretrained with a sentence-level vision–language objective (LAPA) | `pillar-pretrain/` |
+| 3 | CLS template: a classifier on the frozen encoder predicts the 18 CT-RATE findings → one sentence per finding | `pillar-finetune/` |
+| 4 | RET template: a retrieval head on the frozen encoder selects sentences from a gallery of training sentences | `pillar-finetune/` |
+| 5 | MLLM: frozen encoder → Perceiver → Qwen3-8B + LoRA, prompted with the two templates; supervised fine-tuning, then GRPO; ensemble of sampled reports | `CTRG-3D/` |
+| 6 | Inference container that runs stages 1–5 per volume | `docker/` |
 
 Validation split (1,552 studies, official scorer):
 
 | | CRG | macro-F1 | BLEU |
 |---|---|---|---|
-| SFT, public Pillar0-ChestCT encoder | 0.446 | 0.430 | 0.321 |
-| + continued-pretrained encoder | 0.466 | 0.471 | 0.318 |
+| SFT with the public Pillar0-ChestCT encoder | 0.446 | 0.430 | 0.321 |
+| + continued-pretrained encoder (LAPA) | 0.466 | 0.471 | 0.318 |
 | + finding-weighted SFT loss | 0.505 | 0.531 | 0.326 |
-| + GRPO (single policy) | 0.547 | 0.597 | 0.380 |
-| + 10-draw ensemble (submitted) | 0.580 | 0.619 | 0.373 |
+| + GRPO | 0.547 | 0.597 | 0.380 |
+| + ensemble (submitted) | 0.580 | 0.619 | 0.373 |
 
 ## Pretrained weights
 
-All checkpoints are hosted on Hugging Face: **[babbu3682/TG-CTRG](https://huggingface.co/babbu3682/TG-CTRG)** (≈21 GB; Qwen3-8B is fetched separately).
+All checkpoints are on Hugging Face: **[babbu3682/TG-CTRG](https://huggingface.co/babbu3682/TG-CTRG)** (≈21 GB). Qwen3-8B is downloaded separately from its own repository.
 
 ```bash
 pip install -U "huggingface_hub[cli]"
@@ -40,13 +42,11 @@ bash scripts/hf_download_weights.sh babbu3682/TG-CTRG docker/weights
 | file | component |
 |---|---|
 | `lapa_epoch12.pt` | encoder (stage 2) |
-| `cls_finetune_head.pt`, `abn_thresholds_f1max_train_lapa.json` | CLS probe (stage 3) |
-| `ret_head.pt`, `gallery_embeddings_lasthidden.pt`, `gallery_sentences.pt` | RET head and gallery (stage 4) |
-| `ctrg3d/model.safetensors` | MLLM after SFT (stage 5) |
-| `lora/*.safetensors` | 8 GRPO LoRA adapters, one per ensemble draw slice (stage 5) |
-| `radbert/` | RadBERT labeler from the challenge evaluation kit |
-
-Qwen3-8B is downloaded separately from its own repository.
+| `cls_finetune_head.pt`, `abn_thresholds_f1max_train_lapa.json` | classifier and thresholds (stage 3) |
+| `ret_head.pt`, `gallery_embeddings_lasthidden.pt`, `gallery_sentences.pt` | retrieval head and gallery (stage 4) |
+| `ctrg3d/model.safetensors` | MLLM after supervised fine-tuning (stage 5) |
+| `lora/*.safetensors` | GRPO LoRA adapters used by the ensemble (stage 5) |
+| `radbert/` | RadBERT labeler from the challenge evaluation kit (used for the ensemble vote) |
 
 ## Installation
 
@@ -64,11 +64,11 @@ edit them for your environment.
 ```bash
 cd rad-vision-engine && pip install -e .
 vision-engine process --config configs/ct_chest.yaml \
-    --input-series-csv <csv of CT-RATE *_1 series> --output <cache>/train --workers 32
+    --input-series-csv <csv of CT-RATE series> --output <cache>/train --workers 32
 ```
-Builds the LZ4 volume cache (1.25 mm isotropic, central 256 slices, 256×256). Repeat for `valid`.
-The split files `merged_{train,valid}_filtered_prob_half.json` hold, per study, the report,
-its sentences, per-sentence 18-finding labels and the official study-level labels.
+Builds the volume cache (1.25 mm isotropic, central 256 slices, 256×256, lossless compression).
+Repeat for the validation split. The split files `merged_{train,valid}_filtered_prob_half.json`
+hold, per study, the report, its sentences, per-sentence finding labels and the study-level labels.
 
 ```bash
 cd pillar-pretrain
@@ -83,83 +83,74 @@ python scripts/cache_ctrate_embeddings_phrase_align.py --model-name <Qwen3-Embed
 cd pillar-pretrain
 bash train_unimodal_pillar0_ctrate_chest_ct_1node_lapa.sh   # 2×A100, ~2 days
 ```
-Starts from the public `Pillar0-ChestCT` weights. Objective: each report sentence attends over the
-volume's 1,024 spatial tokens and is contrasted against its source volume, with finding labels
-removing same-finding volumes from the negatives; no global image–report term. The checkpoint
-with the lowest validation loss (epoch 12) is used frozen everywhere below.
+Starts from the public `Pillar0-ChestCT` weights. Each report sentence attends over the volume's
+spatial tokens and is contrasted against its source volume; finding labels remove volumes with the
+same finding from the negatives. The checkpoint with the lowest validation loss is used frozen in
+all later stages.
 
-### 3. CLS probe and template
+### 3. CLS template
 
 ```bash
 cd pillar-finetune
-bash scripts/run_ctrate_abnclass.sh configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml \
-     CTRATE_FT_Atlas_abn_bce_self_lapa_maxpool
+bash scripts/run_ctrate_abnclass.sh configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml <run_name>
 python scripts/extract_abn_features.py configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml \
-     --tag lapa_lz4_half --splits dev,train
-python scripts/tune_abn_thresholds.py --cache-dir <cache>/lapa_lz4_half --head-file finetune_head.pt \
-     --output-dir logs/CTRATE/CTRATE_ABN_threshold_tuning_lapa
-python scripts/build_cls_report_templates.py --cache-dir <cache>/lapa_lz4_half --head-file finetune_head.pt \
+     --tag <tag> --splits dev,train
+python scripts/tune_abn_thresholds.py --cache-dir <cache>/<tag> --head-file finetune_head.pt --output-dir <out>
+python scripts/build_cls_report_templates.py --cache-dir <cache>/<tag> --head-file finetune_head.pt \
      --config configs/ctrate_abnclass_finetune_lz4_pillar_self_lapa_maxpool.yaml \
-     --thresholds-json data/abn_thresholds_f1max_train_lapa.json --splits train dev \
-     --output-dir logs/CTRATE/CTRATE_ABN_cls_report_templates_lapa_f1max
+     --thresholds-json data/abn_thresholds_f1max_train_lapa.json --splits train dev --output-dir <out>
 ```
-An MLP probe on max-pooled encoder features predicts the 18 CT-RATE findings; per-class
-thresholds (F1-max on train) turn the probabilities into one positive or negative sentence per
-finding (`cls_report_{train,dev}.json`).
+A small classifier on pooled encoder features predicts the 18 CT-RATE findings. Per-class
+thresholds tuned on the training split turn the probabilities into one positive or negative
+sentence per finding (`cls_report_{train,dev}.json`).
 
-### 4. RET head and template
+### 4. RET template
 
 ```bash
 cd pillar-finetune
-bash scripts/run_ctrate_retrieval.sh configs/ctrate_retrieval_finetune_lz4_pillar_self_lapa.yaml \
-     CTRATE_FT_Atlas_retrieval_self_lapa
-python scripts/build_gallery_lasttoken.py                       # 79,166 training sentences -> embeddings
+bash scripts/run_ctrate_retrieval.sh configs/ctrate_retrieval_finetune_lz4_pillar_self_lapa.yaml <run_name>
+python scripts/build_gallery_lasttoken.py                       # training sentences -> embeddings
 python scripts/ret_inference.py configs/ctrate_retrieval_finetune_lz4_pillar_self_lapa.yaml \
-     --ckpt logs/CTRATE/CTRATE_FT_Atlas_retrieval_self_lapa/checkpoints/best.ckpt \
-     --split train --threshold 0.4 --report-output <out>/train_ret_reports.json      # and --split dev
+     --ckpt <run_dir>/checkpoints/best.ckpt --split train --threshold 0.4 \
+     --report-output <out>/train_ret_reports.json              # and --split dev
 python scripts/build_ret_report_templates.py --reports-json <out>/train_ret_reports.json \
-     --display-overrides data/display_overrides.json \
-     --out-json logs/CTRATE/CTRATE_FT_Atlas_retrieval_self_lapa/templates_ep32_pp/train_ret_reports_pp.json \
+     --display-overrides data/display_overrides.json --out-json <out>/train_ret_reports_pp.json \
      --split-json <pillar-pretrain>/data/merged_train_filtered_prob_half.json
 ```
-A transformer decoder with 64 queries maps the frozen features into the sentence-embedding space;
-sentences whose cosine similarity exceeds 0.4 are retrieved from the gallery and lightly
-normalised (`*_ret_reports_pp.json`).
+A transformer decoder with learned queries maps the frozen features into the sentence-embedding
+space; sentences above a similarity threshold are retrieved from the gallery and lightly normalised.
 
 ### 5. MLLM: SFT → GRPO → ensemble
 
 ```bash
 cd CTRG-3D
-# finding-level token weights from sentence spans
+# finding-level token weights from the sentence labels
 python scripts/build_gt_sentence_weights.py --split_json <pillar-pretrain>/data/merged_train_filtered_prob_half.json \
      --gt_spans GT_report_sentence_label/train_sentence_token_labels.json \
      --gt_sentences GT_report_sentence_label/train_sentences_18labels.json \
      --out data/sentence_labels/train_gt_sentence_labels.json \
      --filtered_split_out data/sentence_labels/merged_train_gtcov.json        # and valid
-# SFT (2×A100, LoRA r=8, 128 visual tokens, label-token weight 5, 15 epochs, lr 5e-5)
+# supervised fine-tuning (2×A100, LoRA r=8, 128 visual tokens, finding-token weight 5, 15 epochs)
 cd scripts && LANG_ENCODER_PATH=<Qwen3-8B> LEARNING_RATE=5e-5 NUM_TRAIN_EPOCHS=15 \
      bash train.sh qwen3_joint_template_new_encoder_template_gtweight
-# cache the frozen visual features, build the GRPO reference (BLEU floors, F1 corpus, reward scales)
-bash ../launchers/run_sbatch_cache_newencB
-bash ../launchers/run_sbatch_grpo_ref_newencB
-# GRPO (reward = alpha*CRG_exam + gamma*dF1 - lambda*BLEU hinge); the ensemble uses four runs
-python grpo_newencB.py --ckpt <sft> --cache_dir <cache> --output_dir ../outputs/grpo_newencB      --alpha 1 --gamma 1 --lambda_bleu 1
-python grpo_newencB.py --ckpt <sft> --cache_dir <cache> --output_dir ../outputs/grpo_B_a2from700  --alpha 2 --gamma 1 --lambda_bleu 1 --resume_from_checkpoint ../outputs/grpo_newencB/checkpoint-700
-python grpo_newencB.py --ckpt <sft> --cache_dir <cache> --output_dir ../outputs/grpo_B_g3         --alpha 1 --gamma 3 --lambda_bleu 0
-python grpo_newencB.py --ckpt <sft> --cache_dir <cache> --output_dir ../outputs/grpo_B_nobleu     --alpha 1 --gamma 1 --lambda_bleu 0
-# draws (one CSV per adapter/sampler) and their RadBERT labels
-python generate_batched.py --ckpt <sft> --cache_dir <cache> --split valid_newenc --adapter ../outputs/<run>/checkpoint-<n> --out ../results/<run>/<tag>.csv
-python ../src/evaluate_reportgen.py --result_csv ../results/<run>/<tag>.csv --out_dir ../results/<run>/<tag>/vlm3d_eval ...
-# label-vote ensemble (order of draws matters; draw 6 is the skeleton)
-D="grpo_newencB/700 grpo_newencB/800 grpo_B_a2from700/1000_t10p95 grpo_newencB/900_t10p95 \
-   grpo_newencB/800_rep100_t10p95 grpo_B_g3/800 grpo_B_a2from700/1000 grpo_newencB/1100_rep100 \
-   grpo_B_nobleu/700 grpo_B_g3/700"
-python label_guided_merge.py --draws $D --mode repair --min_support 3 --backbone 6 --max_add 5 --max_add_impression -1 --out ../results/GBF5I0.csv
-python repair_verify_loop.py --merged ../results/GBF5I0.csv --draws $D --min_support 3 --iters 2 --max_add 2 --out ../results/GBF5I0_v.csv
+# cache the frozen visual features and the GRPO reference statistics (see ../launchers/)
+python build_vision_cache.py --ckpt <sft> --out <cache>
+python build_grpo_reference_crgf1bleu.py --cache_dir <cache> --out <reference>
+# GRPO: reward = alpha * CRG + gamma * dF1 - lambda * BLEU hinge
+python grpo_newencB.py --ckpt <sft> --cache_dir <cache> --output_dir <run> --alpha 1 --gamma 1 --lambda_bleu 1
+# sample reports from a checkpoint and label them
+python generate_batched.py --ckpt <sft> --cache_dir <cache> --adapter <run>/checkpoint-<step> --out <draw>.csv
+python ../src/evaluate_reportgen.py --result_csv <draw>.csv --out_dir <draw>_eval
+# ensemble: vote in label space, repair one draw, verify
+python label_guided_merge.py --draws <draw_1>.csv ... <draw_10>.csv --mode repair --min_support 3 \
+     --backbone <index of the draw to repair> --max_add 5 --max_add_impression -1 --out ensemble.csv
+python repair_verify_loop.py --merged ensemble.csv --draws <draw_1>.csv ... <draw_10>.csv \
+     --min_support 3 --iters 2 --max_add 2 --out final.csv
 ```
-Draw tags: `_t10p95` = temperature 1.0 / top-p 0.95, `_rep100` = repetition penalty 1.0;
-default sampler is T 0.7 / top-p 0.9 / rep 1.05. The SLURM launchers that were actually used are
-in `CTRG-3D/launchers/`.
+The submission used four GRPO runs that differ in reward weights (CRG weight 1 or 2, F1 weight 1
+or 3, with or without the BLEU term) and ten draws taken from their checkpoints with two sampler
+settings. The exact draw list and sampler settings are in `docker/predict.py`; the SLURM launchers
+are in `CTRG-3D/launchers/`.
 
 ### 6. Inference container
 
@@ -169,9 +160,9 @@ bash make_weights.sh        # collects the files above into weights/ (or use the
 bash build.sh && bash test.sh
 docker run --gpus all -v <nii.gz dir>:/input -v <out>:/output -v $PWD/weights:/weights reportgen-pillar-ctrg3d
 ```
-`predict.py` reproduces the full pipeline per volume: preprocessing, encoder, CLS and RET
-templates, ten draws from the MLLM, RadBERT labelling, label vote, skeleton repair and the
-verification loop. Output: `/output/predictions.json`.
+`predict.py` runs the full pipeline per volume: preprocessing, encoder, CLS and RET templates,
+ten sampled reports from the MLLM, RadBERT labelling, label vote, repair and verification.
+Output: `/output/predictions.json`.
 
 ## Citation
 
@@ -181,7 +172,7 @@ linked here when available):
 ```bibtex
 @misc{kyung2026tgctrg,
   title        = {TG-CTRG: Template-Guided CT Report Generation with GRPO post-training and label-vote ensemble},
-  author       = {Kyung, Sunggu},
+  author       = {Kyung, Sunggu and Jeong, Hyekyo and Lim, Jongsoo and Choi, Jiye},
   year         = {2026},
   howpublished = {\url{https://github.com/babbu3682/TG-CTRG}},
   note         = {GitHub repository}
@@ -193,9 +184,9 @@ linked here when available):
 This work builds on, and was inspired by, the following projects:
 
 - **[Pillar-0](https://github.com/YalaLab/pillar-pretrain)** (Agrawal et al., 2025, *Pillar-0: A New Frontier for Radiology Foundation Models*) — the 3D CT encoder architecture, the public `Pillar0-ChestCT` weights we start from, and the [pillar-finetune](https://github.com/YalaLab/pillar-finetune) / [RaVE](https://github.com/YalaLab/rave) tooling our stages 1–4 are derived from.
-- **[RadZero](https://github.com/ahnjonggwon/RadZero)** (Park et al., 2025, *RadZero: Similarity-Based Cross-Attention for Explainable Vision-Language Alignment in Radiology with Zero-Shot Multi-Task Capability*) — the sentence-conditioned cross-attention alignment (VL-CABS) that our encoder pretraining objective extends with label-aware positives and negatives.
+- **[RadZero](https://github.com/ahnjonggwon/RadZero)** (Park et al., 2025, *RadZero: Similarity-Based Cross-Attention for Explainable Vision-Language Alignment in Radiology with Zero-Shot Multi-Task Capability*) — the sentence-conditioned cross-attention alignment that our encoder pretraining objective extends with label-aware positives and negatives.
 - **[PETRG-3D](https://github.com/Jorwnpay/PETRG-3D)** (arXiv 2511.20145) — the 3D encoder → Perceiver → LLM report-generation framework and training code that stage 5 is built on.
-- **[TranSQ](https://github.com/zjukg/TranSQ)** (Kong et al., MICCAI 2022, *TranSQ: Transformer-based Semantic Query for Medical Report Generation*) — the query-based sentence retrieval formulation behind our retrieval head and `<ret_template>`.
+- **[TranSQ](https://github.com/zjukg/TranSQ)** (Kong et al., MICCAI 2022, *TranSQ: Transformer-based Semantic Query for Medical Report Generation*) — the query-based sentence retrieval formulation behind our retrieval head.
 
 We also thank the authors of [Qwen3](https://github.com/QwenLM/Qwen3) and [Qwen3-Embedding](https://github.com/QwenLM/Qwen3-Embedding), [TRL](https://github.com/huggingface/trl) (GRPO), [PEFT](https://github.com/huggingface/peft), and the VLM3D Challenge organisers for the CT-RATE dataset and the RadBERT-based evaluation kit.
 

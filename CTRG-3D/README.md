@@ -8,10 +8,10 @@ Commands, data layout and the exact launcher chain used for the submission are i
 ```
 src/            model (Model/CTRG_3D.py), dataset (Dataset/), training entry (train.py), scorer (evaluate_reportgen.py)
 configs/train/  SFT config chain: qwen3_joint_template.sh -> _new_encoder_template.sh -> _gtweight.sh
-scripts/        vision cache, GT sentence weights, GRPO (grpo_newencB.py + rewards), batched generation,
+scripts/        vision cache, GT sentence weights, GRPO training and rewards, batched generation,
                 sentence labelling, label-guided merge, repair / verify loop
 launchers/      SLURM launchers in the order they were run (see root README)
-storm/          helpers for the non-SLURM GPU host used for GRPO
+storm/          helpers for running GRPO on a stand-alone GPU host
 ds_configs/     DeepSpeed configs
 data/sentence_labels/, GT_report_sentence_label/   GT-derived sentence spans and labels (small JSON)
 ```

@@ -10,7 +10,7 @@ mounted at `/weights` at runtime (download them with `scripts/hf_download_weight
 ./export.sh               # save the image as a tarball for submission
 ```
 
-`predict.py` is the file inside the submitted image (`b0a8a05f`), with only identifiers renamed.
+`predict.py` is the script that ran inside the submitted image.
 `src/pipeline/` holds the six stages (preprocess → encoder → CLS/RET templates → CTRG-3D draws →
 RadBERT labelling → label-vote ensemble + repair/verify); `src/vendor/` is the model code snapshot
 the container runs; `verify/` contains the parity checks used while building the container.

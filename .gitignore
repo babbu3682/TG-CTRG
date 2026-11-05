@@ -21,6 +21,8 @@ checkpoints/
 data/ctrate/
 data/vision_cache/
 data/text_cache*/
+scripts/
+QnA_list.md
 _private/
 .DS_Store
 ._*
